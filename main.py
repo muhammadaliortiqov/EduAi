@@ -18,7 +18,7 @@ load_dotenv()
 GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "")
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-REDIRECT_URI         = os.getenv("REDIRECT_URI", "http://localhost:8501")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "https://eduai-uz.streamlit.app")
 ADMIN_EMAILS         = ["muhammadaliortiqov54@gmail.com"]
 TELEGRAM_USER        = "Ortiqov_ali"
 
