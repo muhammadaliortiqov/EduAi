@@ -508,8 +508,22 @@ def render_login():
             <p style='color:#8892b0;font-size:.9rem;margin:0 0 28px;'>O'rganishni boshlash uchun kiring</p>
         </div>""",unsafe_allow_html=True)
 
-        gu=g_url()
-        if gu:
+    with st.form("login_form"):
+        email = st.text_input("📧 Email", placeholder="email@gmail.com")
+        password = st.text_input("🔑 Parol", type="password", placeholder="Parolingiz")
+        submitted = st.form_submit_button("Kirish", use_container_width=True)
+        if submitted:
+            u = load_user(email)
+            if u and u.get("password") == hashlib.md5(password.encode()).hexdigest():
+                st.session_state["user"] = u
+                st.rerun()
+            else:
+                st.error("Email yoki parol noto'g'ri!")
+    st.markdown("<p style='text-align:center;color:#8892b0;margin:10px 0'>— yoki —</p>", unsafe_allow_html=True)
+
+
+    gu=g_url()
+    if gu:
             st.markdown(f"""<div class='f3' style='text-align:center;margin:0 0 12px;'>
             <a href='{gu}' target='_self' class='gb'>
               <svg width='22' height='22' viewBox='0 0 48 48'>
@@ -524,14 +538,14 @@ def render_login():
             </div>""",unsafe_allow_html=True)
 
 
-        if not gu:
+    if not gu:
             st.markdown("""<div style='background:rgba(255,150,0,0.12);border:1px solid rgba(255,150,0,0.3);
                 border-radius:12px;padding:16px;text-align:center;margin-top:16px;'>
                 <p style='color:#ffaa44;font-size:.9rem;margin:0;'>
                     ⚙️ Google kirish sozlanmagan.<br>
                     <code>.env</code> faylida <b>GOOGLE_CLIENT_ID</b> va <b>GOOGLE_CLIENT_SECRET</b> kiriting.
                 </p></div>""", unsafe_allow_html=True)
-        st.markdown("""<div style='text-align:center;margin-top:20px;'>
+    st.markdown("""<div style='text-align:center;margin-top:20px;'>
             <span class='pill'>🤖 AI O'qituvchi</span><span class='pill'>📊 Analitika</span>
             <span class='pill'>🏆 Turnirlar</span><span class='pill'>🃏 Flashcard</span>
             <span class='pill'>💎 Premium</span></div>""",unsafe_allow_html=True)
