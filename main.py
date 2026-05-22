@@ -175,6 +175,7 @@ def load_user(uid):
             "total_messages":0,"topics":{},"flashcards":[],
             "daily_q":0,"daily_date":"","monthly_t":0,"monthly_date":"",
             "premium":"free","premium_exp":"",
+            "password":"",
             "settings":{"ai_style":"o'qituvchi"}}
 
 def save_user(u):
