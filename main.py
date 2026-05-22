@@ -11,9 +11,38 @@ import numpy as np
 import requests
 from urllib.parse import urlencode
 from groq import Groq
+import gspread
+from google.oauth2.service_account import Credentials
 
 load_dotenv()
+# — GOOGLE SHEETS —
+def get_sheet():
+    try:
+        creds_dict = st.secrets.get("GOOGLE_CREDS", {})
+        if not creds_dict:
+            return None
+        scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(dict(creds_dict), scopes=scopes)
+        client = gspread.authorize(creds)
+        return client.open_by_key("11kZFS9ehD9L1gMKYqMu0NzNIkfnhMah91JJ_PXoC7fk").sheet1
+    except:
+        return None
 
+def sheet_save_user(email, name, password, plan="free", coins=100):
+    sh = get_sheet()
+    if sh:
+        sh.append_row([email, name, email, password, plan, str(coins), datetime.datetime.now().isoformat()])
+
+    u = sheet_load_user(email)    
+    sh = get_sheet()
+    if not sh: return None
+    try:
+        cell = sh.find(email, in_column=1)
+        if cell:
+            row = sh.row_values(cell.row)
+            return {"id":row[0],"name":row[1],"email":row[2],"password":row[3],"plan":row[4],"coins":int(row[5]) if len(row)>5 else 100}
+    except:
+        return None
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "")
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -532,7 +561,7 @@ def render_login():
                     if load_user(reg_email):
                         st.error("Bu email allaqachon ro'yxatdan o'tgan!")
                     else:
-                        save_user({"name":name,"email":reg_email,"password":hashlib.md5(reg_password.encode()).hexdigest(),"plan":"free","coins":100})
+                        sheet_save_user(reg_email, name, hashlib.md5(reg_password.encode()).hexdigest())
                         st.success("✅ Muvaffaqiyatli! Endi 'Kirish' tabiga o'ting.")
 
 
