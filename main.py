@@ -410,10 +410,15 @@ def gen_flash(u,mavzu,n=10):
 # ── GOOGLE AUTH ───────────────────────────────────────────────────────────────
 def g_url():
     if not GOOGLE_CLIENT_ID: return ""
-    return "https://accounts.google.com/o/oauth2/v2/auth?"+urlencode({
-        "client_id":GOOGLE_CLIENT_ID,"redirect_uri":REDIRECT_URI,
-        "response_type":"code","scope":"openid email profile",
-        "access_type":"offline","prompt":"select_account"})
+    params = {
+            "client_id": GOOGLE_CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "access_type": "offline",
+            "prompt": "select_account"
+        }
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
 
 def g_token(code):
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET: return None
