@@ -508,18 +508,31 @@ def render_login():
             <p style='color:#8892b0;font-size:.9rem;margin:0 0 28px;'>O'rganishni boshlash uchun kiring</p>
         </div>""",unsafe_allow_html=True)
 
-    with st.form("login_form"):
-        email = st.text_input("📧 Email", placeholder="email@gmail.com")
-        password = st.text_input("🔑 Parol", type="password", placeholder="Parolingiz")
-        submitted = st.form_submit_button("Kirish", use_container_width=True)
-        if submitted:
-            u = load_user(email)
-            if u and u.get("password") == hashlib.md5(password.encode()).hexdigest():
-                st.session_state["user"] = u
-                st.rerun()
-            else:
-                st.error("Email yoki parol noto'g'ri!")
-    st.markdown("<p style='text-align:center;color:#8892b0;margin:10px 0'>— yoki —</p>", unsafe_allow_html=True)
+        tab1, tab2 = st.tabs(["🔑 Kirish", "📝 Ro'yxatdan o'tish"])
+        with tab1:
+            with st.form("login_form"):
+                email = st.text_input("📧 Email", placeholder="email@gmail.com")
+                password = st.text_input("🔑 Parol", type="password", placeholder="Parolingiz")
+                submitted = st.form_submit_button("Kirish", use_container_width=True)
+                if submitted:
+                    u = load_user(email)
+                    if u and u.get("password") == hashlib.md5(password.encode()).hexdigest():
+                        st.session_state["user"] = u
+                        st.rerun()
+                    else:
+                        st.error("Email yoki parol noto'g'ri!")
+        with tab2:
+            with st.form("register_form"):
+                name = st.text_input("👤 Ism")
+                reg_email = st.text_input("📧 Email")
+                reg_password = st.text_input("🔑 Parol", type="password")
+                submitted2 = st.form_submit_button("Ro'yxatdan o'tish", use_container_width=True)
+                if submitted2:
+                    if load_user(reg_email):
+                        st.error("Bu email allaqachon ro'yxatdan o'tgan!")
+                    else:
+                        save_user({"name":name,"email":reg_email,"password":hashlib.md5(reg_password.encode()).hexdigest(),"plan":"free","coins":100})
+                        st.success("✅ Muvaffaqiyatli! Endi 'Kirish' tabiga o'ting.")
 
 
     gu=g_url()
