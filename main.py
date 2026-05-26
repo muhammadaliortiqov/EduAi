@@ -1,2235 +1,1704 @@
 """
-EduAI UZ v3.1 — Smarter Learning, Better Future
-Barcha xatolar tuzatildi:
-  - Logo dan bulutcha olib tashlandi
-  - Email/parol login to'g'irlandi (uid = md5(email))
-  - sheet_save_user ichidagi broken kod tuzatildi
-  - Google OAuth callback ishonchli qilindi
-  - Chat tarixi yangilanganda saqlanadi
-  - Barcha import va funksiyalar to'g'ri
+EduAI UZ v5.0 - Smarter Learning, Better Future
+Barcha muammolar hal qilindi:
+  - Logo PNG (logo.png) ko'rsatish, yo'q bo'lsa SVG (bulutchasiz)
+  - Demo va Google kirish yo'q - faqat Email/Parol
+  - Session token: bir marta kirgandan keyin qayta so'ralmaydi
+  - Chat sidebar: Claude uslubida (New Chat, Search, Recents)
+  - Fanlar tezkor tugmalari olib tashlandi
+  - 3 til: O'zbek / English / Русский
+  - Mobil: bottom navigation
+  - AI: super maximal system prompt
 """
 
 import streamlit as st
-import os, json, time, random, hashlib, datetime, re, base64
+import os, json, time, hashlib, datetime, re, base64, uuid
 from pathlib import Path
 from dotenv import load_dotenv
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import requests
-from urllib.parse import urlencode
-from groq import Groq
+import google.generativeai as genai
 import gspread
 from google.oauth2.service_account import Credentials
 
 load_dotenv()
 
-# ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
-def get_sheet():
-    try:
-        creds_dict = st.secrets.get("GOOGLE_CREDS", {})
-        if not creds_dict:
-            return None
-        scopes = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        creds = Credentials.from_service_account_info(dict(creds_dict), scopes=scopes)
-        client = gspread.authorize(creds)
-        return client.open_by_key("11kZFS9ehD9L1gMKYqMu0NzNIkfnhMah91JJ_PXoC7fk").sheet1
-    except:
-        return None
-
-
-def sheet_save_user(email, name, password, plan="free", coins=100):
-    """Google Sheets ga yangi foydalanuvchi saqlash."""
-    sh = get_sheet()
-    if sh:
-        try:
-            sh.append_row([
-                email, name, email, password, plan,
-                str(coins), datetime.datetime.now().isoformat()
-            ])
-        except:
-            pass
-
-
-def sheet_load_user(email):
-    """Google Sheets dan foydalanuvchi yuklash."""
-    sh = get_sheet()
-    if not sh:
-        return None
-    try:
-        cell = sh.find(email, in_column=1)
-        if cell:
-            row = sh.row_values(cell.row)
-            return {
-                "id":       row[0],
-                "name":     row[1],
-                "email":    row[2],
-                "password": row[3],
-                "plan":     row[4],
-                "coins":    int(row[5]) if len(row) > 5 else 100
-            }
-    except:
-        return None
-
-
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "")
-GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-REDIRECT_URI         = os.getenv("REDIRECT_URI", "https://eduai-uz.streamlit.app")
-ADMIN_EMAILS         = ["muhammadaliortiqov54@gmail.com"]
-TELEGRAM_USER        = "Ortiqov_ali"
+api_key = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=api_key)
+ADMIN_EMAILS  = ["muhammadaliortiqov54@gmail.com"]
+TELEGRAM_USER = "Ortiqov_ali"
 
 PLANS = {
-    "free":    {"nom": "Bepul",           "narx": 0,     "emoji": "🆓"},
-    "student": {"nom": "Student Premium", "narx": 29900, "emoji": "⭐"},
-    "pro":     {"nom": "Pro Premium",     "narx": 59900, "emoji": "🏆"},
-    "teacher": {"nom": "O'qituvchi",      "narx": 99900, "emoji": "👨‍🏫"},
+    "free":    {"nom":"Bepul",          "name":"Free",    "имя":"Бесплатно", "narx":0,     "emoji":"🆓"},
+    "student": {"nom":"Student Premium","name":"Student", "имя":"Студент",   "narx":29900, "emoji":"⭐"},
+    "pro":     {"nom":"Pro Premium",    "name":"Pro",     "имя":"Про",       "narx":59900, "emoji":"🏆"},
+    "teacher": {"nom":"O'qituvchi",     "name":"Teacher", "имя":"Учитель",   "narx":99900, "emoji":"👨‍🏫"},
 }
-FREE_Q_LIMIT = 20   # kunlik savol (bepul)
-FREE_T_LIMIT = 5    # oylik test  (bepul)
+FREE_Q   = 20
+FREE_T   = 5
 
 # ── PAPKALAR ──────────────────────────────────────────────────────────────────
-for _d in ["data/users", "data/history", "data/announce", "data/books"]:
+for _d in ["data/users","data/history","data/announce","data/books","data/sessions"]:
     Path(_d).mkdir(parents=True, exist_ok=True)
 
-# ── SAHIFA ────────────────────────────────────────────────────────────────────
+# ── TIL ───────────────────────────────────────────────────────────────────────
+TR = {
+    "login":        {"uz":"Kirish",             "en":"Login",          "ru":"Войти"},
+    "register":     {"uz":"Ro'yxatdan o'tish",  "en":"Register",       "ru":"Регистрация"},
+    "email":        {"uz":"📧 Email",           "en":"📧 Email",       "ru":"📧 Email"},
+    "password":     {"uz":"🔑 Parol",           "en":"🔑 Password",    "ru":"🔑 Пароль"},
+    "login_btn":    {"uz":"Kirish ->",           "en":"Login ->",        "ru":"Войти ->"},
+    "reg_btn":      {"uz":"Ro'yxatdan o'tish ->","en":"Register ->",     "ru":"Зарегистрироваться ->"},
+    "wrong_pass":   {"uz":"❌ Email yoki parol noto'g'ri!","en":"❌ Wrong email or password!","ru":"❌ Неверный email или пароль!"},
+    "pass_short":   {"uz":"⚠️ Parol kamida 6 belgi!","en":"⚠️ Min 6 characters!","ru":"⚠️ Минимум 6 символов!"},
+    "name_empty":   {"uz":"⚠️ Ism kiriting!","en":"⚠️ Enter name!","ru":"⚠️ Введите имя!"},
+    "email_exists": {"uz":"❌ Email allaqachon ro'yxatdan o'tgan!","en":"❌ Email already registered!","ru":"❌ Email уже зарегистрирован!"},
+    "reg_ok":       {"uz":"✅ Muvaffaqiyatli! 'Kirish' tabiga o'ting.","en":"✅ Success! Go to Login tab.","ru":"✅ Успешно! Перейдите на вход."},
+    "name":         {"uz":"👤 Ism","en":"👤 Name","ru":"👤 Имя"},
+    "new_chat":     {"uz":"Yangi suhbat","en":"New chat","ru":"Новый чат"},
+    "search":       {"uz":"Qidirish...","en":"Search...","ru":"Поиск..."},
+    "today":        {"uz":"Bugun","en":"Today","ru":"Сегодня"},
+    "yesterday":    {"uz":"Kecha","en":"Yesterday","ru":"Вчера"},
+    "older":        {"uz":"Oldingi","en":"Earlier","ru":"Ранее"},
+    "chat":         {"uz":"Suhbat","en":"Chat","ru":"Чат"},
+    "analytics":    {"uz":"Analitika","en":"Analytics","ru":"Аналитика"},
+    "tests":        {"uz":"Testlar","en":"Tests","ru":"Тесты"},
+    "flashcard":    {"uz":"Flashcard","en":"Flashcard","ru":"Флэшкарты"},
+    "tournament":   {"uz":"Turnir","en":"Tournament","ru":"Турнир"},
+    "library":      {"uz":"Kutubxona","en":"Library","ru":"Библиотека"},
+    "books":        {"uz":"Kitoblar","en":"Books","ru":"Книги"},
+    "premium":      {"uz":"Premium","en":"Premium","ru":"Премиум"},
+    "settings":     {"uz":"Sozlamalar","en":"Settings","ru":"Настройки"},
+    "admin":        {"uz":"Admin","en":"Admin","ru":"Админ"},
+    "logout":       {"uz":"🚪 Chiqish","en":"🚪 Logout","ru":"🚪 Выйти"},
+    "welcome":      {"uz":"Assalomu alaykum! Men EduAI UZman. 👋","en":"Hello! I am EduAI UZ. 👋","ru":"Привет! Я EduAI UZ. 👋"},
+    "welcome_sub":  {"uz":"Savolingizni yozing - tushuntiraman!","en":"Ask me anything!","ru":"Задайте вопрос!"},
+    "ask_me":       {"uz":"Savolingizni yozing...","en":"Ask anything...","ru":"Введите вопрос..."},
+    "thinking":     {"uz":"⏳ AI o'ylamoqda...","en":"⏳ AI thinking...","ru":"⏳ AI думает..."},
+    "mode_chat":    {"uz":"💬 Oddiy suhbat","en":"💬 Regular chat","ru":"💬 Обычный чат"},
+    "mode_code":    {"uz":"👨‍💻 Kod rejimi","en":"👨‍💻 Code mode","ru":"👨‍💻 Режим кода"},
+    "mode_book":    {"uz":"📖 Kitob tahlili","en":"📖 Book analysis","ru":"📖 Анализ книги"},
+    "clear":        {"uz":"🗑️ Tozalash","en":"🗑️ Clear","ru":"🗑️ Очистить"},
+    "get_premium":  {"uz":"💎 Premium olish","en":"💎 Get Premium","ru":"💎 Получить Premium"},
+    "daily_limit":  {"uz":"⚠️ Kunlik {n} savol limitiga yetdingiz!","en":"⚠️ Daily limit of {n} reached!","ru":"⚠️ Достигнут дневной лимит {n}!"},
+    "streak":       {"uz":"kun streak","en":"day streak","ru":"дней подряд"},
+    "level":        {"uz":"Daraja","en":"Level","ru":"Уровень"},
+    "save":         {"uz":"💾 Saqlash","en":"💾 Save","ru":"💾 Сохранить"},
+    "welcome_title":{"uz":"Xush kelibsiz! 👋","en":"Welcome! 👋","ru":"Добро пожаловать! 👋"},
+}
+
+def t(key, **kw):
+    lang = st.session_state.get("lang","uz")
+    txt  = TR.get(key, {}).get(lang, TR.get(key, {}).get("uz", key))
+    for k, v in kw.items():
+        txt = txt.replace("{"+k+"}", str(v))
+    return txt
+
+# ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="EduAI UZ",
     page_icon="🎓",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed",
 )
 
-# ── LOGO (bulutchasiz) ────────────────────────────────────────────────────────
-# Bulutcha butunlay olib tashlandi. Faqat kitob + miya mikrosxema qoldi.
-_LOGO = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" width="{sz}" height="{sz}">
+# ── LOGO ──────────────────────────────────────────────────────────────────────
+def get_logo_b64(sz=160) -> str:
+    """PNG logo borligini tekshiradi, yo'q bo'lsa SVG ishlatadi."""
+    for fn in ["logo.png", "assets/logo.png", "data/logo.png"]:
+        p = Path(fn)
+        if p.exists():
+            with open(p, "rb") as f:
+                b = base64.b64encode(f.read()).decode()
+            return f'<img src="data:image/png;base64,{b}" width="{sz}" height="{sz}" style="display:block;margin:0 auto;object-fit:contain;border-radius:0;"/>'
+    # Fallback SVG - bulutchasiz, asl logoga o'xshash
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="{sz}" height="{sz}">
 <defs>
-  <linearGradient id="lg1" x1="0%" y1="0%" x2="100%" y2="100%">
-    <stop offset="0%"   style="stop-color:#00cfff"/>
-    <stop offset="50%"  style="stop-color:#5a7fff"/>
-    <stop offset="100%" style="stop-color:#7b5ea7"/>
+  <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" style="stop-color:#00d4ff"/><stop offset="50%" style="stop-color:#5a7fff"/>
+    <stop offset="100%" style="stop-color:#8b5cf6"/>
   </linearGradient>
-  <linearGradient id="lg2" x1="0%" y1="0%" x2="100%" y2="100%">
-    <stop offset="0%"   style="stop-color:#a0b8ff"/>
-    <stop offset="100%" style="stop-color:#7b5ea7"/>
+  <linearGradient id="g2" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" style="stop-color:#a8c8ff"/><stop offset="100%" style="stop-color:#8b5cf6"/>
   </linearGradient>
-  <filter id="gw">
-    <feGaussianBlur stdDeviation="3" result="b"/>
-    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-  </filter>
-  <filter id="sg">
-    <feGaussianBlur stdDeviation="6" result="b"/>
-    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-  </filter>
+  <filter id="glow"><feGaussianBlur stdDeviation="3" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  <filter id="glow2"><feGaussianBlur stdDeviation="6" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
 </defs>
 
-<!-- Miya (bulutchasiz - oddiy yumaloq miya shakli) -->
-<g filter="url(#sg)">
-  <ellipse cx="118" cy="138" rx="62" ry="55"
-    fill="none" stroke="url(#lg1)" stroke-width="3"
-    stroke-linecap="round"/>
-  <path d="M80,110 Q70,95 82,85 Q95,76 108,86"
-    fill="none" stroke="url(#lg1)" stroke-width="2.5" stroke-linecap="round"/>
-  <path d="M118,83 Q118,72 128,68 Q140,65 146,76"
-    fill="none" stroke="url(#lg1)" stroke-width="2.5" stroke-linecap="round"/>
-  <path d="M100,170 Q88,182 78,175 Q66,166 72,154"
-    fill="none" stroke="url(#lg1)" stroke-width="2.5" stroke-linecap="round"/>
-  <path d="M136,178 Q140,190 130,195 Q118,198 114,186"
-    fill="none" stroke="url(#lg1)" stroke-width="2.5" stroke-linecap="round"/>
-  <!-- Miya bo'limlari -->
-  <line x1="118" y1="85"  x2="118" y2="190" stroke="url(#lg1)" stroke-width="1.5" stroke-dasharray="4,4" opacity="0.4"/>
-  <path d="M80,138 Q95,125 118,130 Q141,135 158,125"
-    fill="none" stroke="url(#lg1)" stroke-width="1.5" opacity="0.5"/>
+<!-- MIYA (bulutchasiz, yaxlit ellips + bo'linma) -->
+<g filter="url(#glow2)" opacity="0.95">
+  <!-- Asosiy miya shakli -->
+  <ellipse cx="148" cy="170" rx="76" ry="68" fill="none" stroke="url(#g1)" stroke-width="3.5" stroke-linecap="round"/>
+  <!-- Yuqori bo'rtmalar -->
+  <path d="M100,130 Q88,112 100,100 Q114,89 128,102" fill="none" stroke="url(#g1)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M148,100 Q148,86 160,82 Q174,78 180,94" fill="none" stroke="url(#g1)" stroke-width="3" stroke-linecap="round"/>
+  <!-- Pastki bo'rtmalar -->
+  <path d="M120,216 Q106,230 96,222 Q82,210 90,196" fill="none" stroke="url(#g1)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M168,222 Q172,236 160,240 Q146,244 142,228" fill="none" stroke="url(#g1)" stroke-width="3" stroke-linecap="round"/>
+  <!-- Miya bo'limlari chiziqlari -->
+  <line x1="148" y1="102" x2="148" y2="236" stroke="url(#g1)" stroke-width="2" stroke-dasharray="5,5" opacity="0.4"/>
+  <path d="M98,170 Q120,155 148,162 Q176,169 194,155" fill="none" stroke="url(#g1)" stroke-width="1.8" opacity="0.5"/>
 
-  <!-- Kitob (o'ng tomon) -->
-  <path d="M192,58 C212,52 244,60 258,78 L262,194 C248,178 216,170 196,174 Z"
-    fill="none" stroke="url(#lg2)" stroke-width="3.5" stroke-linecap="round"/>
-  <line x1="172" y1="70" x2="192" y2="180" stroke="url(#lg2)" stroke-width="2.5" stroke-linecap="round"/>
-  <path d="M172,70 C152,64 124,72 114,88 L110,192 C124,180 152,172 170,176 Z"
-    fill="none" stroke="url(#lg2)" stroke-width="3" stroke-linecap="round"/>
+  <!-- KITOB (o'ng tomon) -->
+  <path d="M234,70 C258,63 296,73 312,94 L318,238 C300,220 262,210 238,214 Z"
+    fill="none" stroke="url(#g2)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="210" y1="84" x2="234" y2="220" stroke="url(#g2)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M210,84 C186,77 150,87 138,106 L134,238 C152,222 188,212 208,216 Z"
+    fill="none" stroke="url(#g2)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
 </g>
 
-<!-- AI Chip -->
-<g filter="url(#gw)">
-  <rect x="148" y="108" width="64" height="64" rx="10"
-    fill="#0a0a1e" stroke="url(#lg1)" stroke-width="2.5"/>
-  <rect x="158" y="118" width="44" height="44" rx="6"
-    fill="#0d0d2e" stroke="url(#lg1)" stroke-width="1.5" opacity="0.8"/>
-  <!-- Ustki pinlar -->
-  <line x1="160" y1="108" x2="160" y2="96" stroke="#00cfff" stroke-width="2" stroke-linecap="round"/>
-  <line x1="172" y1="108" x2="172" y2="94" stroke="#00cfff" stroke-width="2" stroke-linecap="round"/>
-  <line x1="184" y1="108" x2="184" y2="96" stroke="#00cfff" stroke-width="2" stroke-linecap="round"/>
-  <line x1="196" y1="108" x2="196" y2="94" stroke="#7b5ea7" stroke-width="2" stroke-linecap="round"/>
-  <!-- Pastki pinlar -->
-  <line x1="160" y1="172" x2="160" y2="184" stroke="#00cfff" stroke-width="2" stroke-linecap="round"/>
-  <line x1="172" y1="172" x2="172" y2="186" stroke="#00cfff" stroke-width="2" stroke-linecap="round"/>
-  <line x1="184" y1="172" x2="184" y2="184" stroke="#00cfff" stroke-width="2" stroke-linecap="round"/>
-  <!-- Chap pinlar -->
-  <line x1="148" y1="122" x2="134" y2="122" stroke="#00cfff" stroke-width="2" stroke-linecap="round"/>
-  <line x1="148" y1="134" x2="132" y2="134" stroke="#7b5ea7" stroke-width="2" stroke-linecap="round"/>
-  <line x1="148" y1="146" x2="134" y2="146" stroke="#00cfff" stroke-width="2" stroke-linecap="round"/>
-  <line x1="148" y1="158" x2="132" y2="158" stroke="#7b5ea7" stroke-width="2" stroke-linecap="round"/>
-  <!-- O'ng pinlar -->
-  <line x1="212" y1="122" x2="226" y2="122" stroke="#00cfff" stroke-width="2" stroke-linecap="round"/>
-  <line x1="212" y1="134" x2="228" y2="134" stroke="#7b5ea7" stroke-width="2" stroke-linecap="round"/>
-  <line x1="212" y1="146" x2="226" y2="146" stroke="#00cfff" stroke-width="2" stroke-linecap="round"/>
-  <line x1="212" y1="158" x2="228" y2="158" stroke="#7b5ea7" stroke-width="2" stroke-linecap="round"/>
-  <!-- AI yozuvi -->
-  <text x="180" y="146" text-anchor="middle" dominant-baseline="middle"
-    font-family="Arial Black,sans-serif" font-weight="900" font-size="22"
-    fill="url(#lg1)" filter="url(#gw)">AI</text>
+<!-- AI CHIP -->
+<g filter="url(#glow)">
+  <rect x="184" y="132" width="74" height="74" rx="12" fill="#06061a" stroke="url(#g1)" stroke-width="3"/>
+  <rect x="196" y="144" width="50" height="50" rx="7" fill="#0a0a22" stroke="url(#g1)" stroke-width="1.8" opacity="0.7"/>
+  <!-- Pinlar yuqori -->
+  <line x1="198" y1="132" x2="198" y2="118" stroke="#00d4ff" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="212" y1="132" x2="212" y2="115" stroke="#00d4ff" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="226" y1="132" x2="226" y2="118" stroke="#00d4ff" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="240" y1="132" x2="240" y2="115" stroke="#8b5cf6" stroke-width="2.2" stroke-linecap="round"/>
+  <!-- Pinlar pastki -->
+  <line x1="198" y1="206" x2="198" y2="220" stroke="#00d4ff" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="212" y1="206" x2="212" y2="222" stroke="#00d4ff" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="226" y1="206" x2="226" y2="220" stroke="#00d4ff" stroke-width="2.2" stroke-linecap="round"/>
+  <!-- Pinlar chap -->
+  <line x1="184" y1="148" x2="168" y2="148" stroke="#00d4ff" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="184" y1="162" x2="164" y2="162" stroke="#8b5cf6" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="184" y1="176" x2="168" y2="176" stroke="#00d4ff" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="184" y1="190" x2="164" y2="190" stroke="#8b5cf6" stroke-width="2.2" stroke-linecap="round"/>
+  <!-- Pinlar o'ng -->
+  <line x1="258" y1="148" x2="274" y2="148" stroke="#00d4ff" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="258" y1="162" x2="276" y2="162" stroke="#8b5cf6" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="258" y1="176" x2="274" y2="176" stroke="#00d4ff" stroke-width="2.2" stroke-linecap="round"/>
+  <line x1="258" y1="190" x2="276" y2="190" stroke="#8b5cf6" stroke-width="2.2" stroke-linecap="round"/>
+  <!-- AI matn -->
+  <text x="221" y="176" text-anchor="middle" dominant-baseline="middle"
+    font-family="Arial Black,sans-serif" font-weight="900" font-size="24"
+    fill="url(#g1)" filter="url(#glow)">AI</text>
 </g>
 
 <!-- Miya-chip ulanish chiziqlari -->
-<g stroke="#00cfff" stroke-width="1.8" fill="none" opacity="0.85" stroke-linecap="round">
-  <line x1="130" y1="108" x2="148" y2="122"/>
-  <line x1="110" y1="124" x2="132" y2="134"/>
-  <line x1="114" y1="148" x2="134" y2="146"/>
-  <line x1="118" y1="166" x2="132" y2="158"/>
-  <circle cx="126" cy="106" r="4" stroke="#00cfff" fill="#050510" stroke-width="2"/>
-  <circle cx="106" cy="122" r="4" stroke="#00cfff" fill="#050510" stroke-width="2"/>
-  <circle cx="108" cy="146" r="4" stroke="#7b5ea7" fill="#050510" stroke-width="2"/>
-  <circle cx="112" cy="168" r="4" stroke="#7b5ea7" fill="#050510" stroke-width="2"/>
+<g stroke="#00d4ff" stroke-width="2" fill="none" opacity="0.9" stroke-linecap="round">
+  <line x1="160" y1="132" x2="184" y2="148"/>
+  <line x1="138" y1="152" x2="164" y2="162"/>
+  <line x1="142" y1="176" x2="168" y2="176"/>
+  <line x1="146" y1="200" x2="164" y2="190"/>
+  <circle cx="156" cy="130" r="4.5" fill="#06061a" stroke-width="2.2"/>
+  <circle cx="134" cy="150" r="4.5" fill="#06061a" stroke-width="2.2"/>
+  <circle cx="136" cy="174" r="4.5" stroke="#8b5cf6" fill="#06061a" stroke-width="2.2"/>
+  <circle cx="140" cy="202" r="4.5" stroke="#8b5cf6" fill="#06061a" stroke-width="2.2"/>
 </g>
 
-<!-- Matn -->
-<text x="85"  y="244" font-family="Arial Black,sans-serif" font-weight="900"
-  font-size="54" fill="white" letter-spacing="-1">Edu</text>
-<text x="193" y="244" font-family="Arial Black,sans-serif" font-weight="900"
-  font-size="54" fill="url(#lg1)" letter-spacing="-1">AI</text>
-<line x1="100" y1="258" x2="135" y2="258" stroke="url(#lg1)" stroke-width="1.5"/>
-<text x="160" y="263" text-anchor="middle" font-family="Arial,sans-serif"
-  font-weight="700" font-size="13" fill="#00cfff" letter-spacing="5">UZ</text>
-<line x1="185" y1="258" x2="220" y2="258" stroke="url(#lg1)" stroke-width="1.5"/>
-<text x="160" y="285" text-anchor="middle" font-family="Arial,sans-serif"
-  font-size="9.5" fill="#8892b0" letter-spacing="2.5">SMARTER LEARNING, BETTER FUTURE</text>
+<!-- MATN -->
+<text x="100" y="296" font-family="Arial Black,sans-serif" font-weight="900" font-size="66" fill="white" letter-spacing="-2">Edu</text>
+<text x="238" y="296" font-family="Arial Black,sans-serif" font-weight="900" font-size="66" fill="url(#g1)" letter-spacing="-2">AI</text>
+<!-- UZ -->
+<line x1="116" y1="314" x2="156" y2="314" stroke="url(#g1)" stroke-width="1.8"/>
+<text x="200" y="320" text-anchor="middle" font-family="Arial,sans-serif" font-weight="700"
+  font-size="15" fill="#00d4ff" letter-spacing="6">UZ</text>
+<line x1="244" y1="314" x2="284" y2="314" stroke="url(#g1)" stroke-width="1.8"/>
+<!-- Tagline -->
+<text x="200" y="344" text-anchor="middle" font-family="Arial,sans-serif"
+  font-size="10" fill="#6b7fa3" letter-spacing="2.8">SMARTER LEARNING, BETTER FUTURE</text>
 </svg>"""
-
-
-def logo_img(sz=200):
-    s = _LOGO.replace("{sz}", str(sz))
-    b = base64.b64encode(s.encode("utf-8")).decode("utf-8")
-    return (f'<img src="data:image/svg+xml;base64,{b}" '
-            f'width="{sz}" height="{sz}" style="display:block;margin:0 auto;"/>')
-
+    b = base64.b64encode(svg.encode()).decode()
+    return f'<img src="data:image/svg+xml;base64,{b}" width="{sz}" height="{sz}" style="display:block;margin:0 auto;"/>'
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
-def css():
+def inject_css():
     st.markdown("""<style>
+/* ─ Reset ─ */
+*{box-sizing:border-box;margin:0;padding:0;}
 :root{
-  --c1:#00cfff;--c2:#7b5ea7;--c3:#00ff9f;
-  --txt:#e8eaf6;--m:#8892b0;
-  --gl:rgba(255,255,255,0.04);
-  --bd:rgba(0,207,255,0.18);--r:16px;
+  --c1:#00d4ff; --c2:#8b5cf6; --c3:#00ff9f;
+  --bg:#0a0a10; --bg2:#111118; --bg3:#181824;
+  --txt:#e8eaf6; --muted:#8892b0;
+  --glass:rgba(255,255,255,.04);
+  --bd:rgba(0,212,255,.15);
+  --r:14px;
 }
-.stApp{
-  background:#050510;
-  background-image:
-    radial-gradient(ellipse 80% 50% at 20% 10%,rgba(0,100,200,.18) 0%,transparent 60%),
-    radial-gradient(ellipse 60% 40% at 80% 80%,rgba(123,94,167,.15) 0%,transparent 60%);
-  color:var(--txt);font-family:'Segoe UI',sans-serif;
+.stApp{background:var(--bg)!important;color:var(--txt)!important;font-family:'Segoe UI',system-ui,sans-serif!important;}
+.stApp::before{content:'';position:fixed;inset:0;
+  background:radial-gradient(ellipse 80% 50% at 10% 5%,rgba(0,100,200,.18) 0,transparent 55%),
+             radial-gradient(ellipse 60% 40% at 90% 90%,rgba(139,92,246,.15) 0,transparent 55%);
+  pointer-events:none;z-index:0;}
+
+/* ─ Hide Streamlit chrome ─ */
+#MainMenu,footer,[data-testid="collapsedControl"],
+section[data-testid="stSidebar"]{display:none!important;}
+.stMainBlockContainer,.block-container{padding:0!important;max-width:100%!important;}
+div[data-testid="stVerticalBlock"]{gap:0!important;}
+
+/* ==============================================
+   LAYOUT
+============================================== */
+#app-wrap{display:flex;height:100vh;overflow:hidden;position:relative;z-index:1;}
+
+/* ─ Sidebar ─ */
+#sb{
+  width:256px;min-width:256px;
+  background:linear-gradient(180deg,#0d0d1e,#0a0a16);
+  border-right:1px solid var(--bd);
+  display:flex;flex-direction:column;height:100vh;
+  transition:transform .25s ease,width .25s ease;
+  position:relative;z-index:10;flex-shrink:0;
 }
-section[data-testid="stSidebar"]{
-  background:linear-gradient(180deg,#080820,#0d0d2b)!important;
-  border-right:1px solid var(--bd)!important;
-}
-.gc{
-  background:var(--gl);border:1px solid var(--bd);
-  border-radius:var(--r);padding:20px;
-  backdrop-filter:blur(12px);
-  box-shadow:0 8px 32px rgba(0,0,0,.6);
-  margin-bottom:16px;transition:border-color .3s;
-}
-.gc:hover{border-color:var(--c1);}
-.cu{
-  background:linear-gradient(135deg,rgba(0,100,200,.35),rgba(0,207,255,.15));
-  border:1px solid rgba(0,207,255,.25);
-  border-radius:18px 18px 4px 18px;
-  padding:14px 18px;margin:8px 0;
-  max-width:80%;margin-left:auto;color:#fff;
-}
-.ca{
-  background:linear-gradient(135deg,rgba(20,20,60,.8),rgba(123,94,167,.2));
-  border:1px solid rgba(123,94,167,.3);
-  border-radius:18px 18px 18px 4px;
-  padding:14px 18px;margin:8px 0;
-  max-width:85%;color:var(--txt);line-height:1.6;
-}
-.xo{background:rgba(255,255,255,.08);border-radius:20px;height:12px;overflow:hidden;margin:6px 0;}
-.xi{height:100%;border-radius:20px;background:linear-gradient(90deg,var(--c2),var(--c1));transition:width .8s;}
-.sc{background:var(--gl);border:1px solid var(--bd);border-radius:12px;padding:16px;text-align:center;}
-.sn{font-size:2rem;font-weight:700;
+#sb.hidden{transform:translateX(-256px);width:0;min-width:0;}
+
+/* sidebar logo+new chat row */
+.sb-top{padding:14px 12px 10px;border-bottom:1px solid var(--bd);}
+.sb-brand{display:flex;align-items:center;gap:8px;margin-bottom:12px;}
+.sb-brand-txt{font-weight:800;font-size:.95rem;
   background:linear-gradient(135deg,var(--c1),var(--c2));
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;}
-.bdg{display:inline-block;padding:4px 12px;border-radius:20px;font-size:.75rem;
-  font-weight:600;background:linear-gradient(135deg,var(--c2),var(--c1));color:#fff;margin:2px;}
-.pfree{background:linear-gradient(135deg,#444,#666);}
-.pstudent{background:linear-gradient(135deg,#f59e0b,#fbbf24);}
-.ppro{background:linear-gradient(135deg,var(--c2),var(--c1));}
-.pteacher{background:linear-gradient(135deg,#059669,#10b981);}
-.fc{
-  background:linear-gradient(135deg,rgba(0,207,255,.1),rgba(123,94,167,.1));
-  border:1px solid rgba(0,207,255,.3);border-radius:20px;padding:40px;
-  text-align:center;min-height:200px;cursor:pointer;transition:transform .3s;
-  display:flex;align-items:center;justify-content:center;font-size:1.3rem;
+.sb-new-btn{
+  width:100%;padding:9px 14px;
+  background:rgba(0,212,255,.08);
+  border:1px solid rgba(0,212,255,.2);
+  border-radius:10px;color:var(--c1);
+  font-size:.85rem;font-weight:600;cursor:pointer;
+  display:flex;align-items:center;gap:8px;
+  transition:background .2s;
 }
-.fc:hover{transform:scale(1.02);}
-.ann{
-  background:linear-gradient(135deg,rgba(0,207,255,.08),rgba(123,94,167,.08));
-  border-left:4px solid var(--c1);border-radius:8px;padding:12px 16px;margin:8px 0;
+.sb-new-btn:hover{background:rgba(0,212,255,.15);}
+
+/* sidebar search */
+.sb-search{padding:8px 12px;}
+.sb-search input{
+  width:100%;background:rgba(255,255,255,.05);
+  border:1px solid var(--bd);border-radius:9px;
+  padding:7px 12px;color:var(--txt);font-size:.82rem;
+  outline:none;transition:border-color .2s;
 }
+.sb-search input:focus{border-color:rgba(0,212,255,.35);}
+
+/* sidebar history */
+.sb-hist{flex:1;overflow-y:auto;padding:0 6px 6px;}
+.sb-hist::-webkit-scrollbar{width:3px;}
+.sb-hist::-webkit-scrollbar-thumb{background:var(--c2);border-radius:3px;}
+.sb-date{font-size:.7rem;color:var(--muted);
+  padding:8px 8px 3px;font-weight:700;text-transform:uppercase;letter-spacing:.9px;}
+.sb-item{
+  padding:8px 10px;border-radius:9px;
+  font-size:.82rem;color:var(--txt);
+  cursor:pointer;transition:background .15s;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  margin-bottom:1px;
+}
+.sb-item:hover{background:rgba(255,255,255,.07);}
+.sb-item.active{background:rgba(0,212,255,.1);color:var(--c1);}
+
+/* sidebar footer */
+.sb-foot{
+  border-top:1px solid var(--bd);
+  padding:10px 12px;
+}
+.sb-user{
+  display:flex;align-items:center;gap:10px;
+  padding:8px 8px;border-radius:10px;cursor:pointer;
+  transition:background .15s;margin-bottom:5px;
+}
+.sb-user:hover{background:rgba(255,255,255,.06);}
+.sb-avatar{
+  width:32px;height:32px;border-radius:50%;
+  background:linear-gradient(135deg,var(--c2),var(--c1));
+  display:flex;align-items:center;justify-content:center;
+  font-weight:800;font-size:.85rem;color:#fff;flex-shrink:0;
+}
+.xbar{height:4px;background:rgba(255,255,255,.06);border-radius:4px;margin:3px 0 8px;}
+.xbar-fill{height:100%;border-radius:4px;background:linear-gradient(90deg,var(--c2),var(--c1));}
+
+/* ─ Main ─ */
+#main{flex:1;display:flex;flex-direction:column;height:100vh;overflow:hidden;min-width:0;}
+
+/* ─ Topbar ─ */
+#topbar{
+  height:50px;border-bottom:1px solid var(--bd);
+  background:rgba(10,10,16,.96);backdrop-filter:blur(10px);
+  display:flex;align-items:center;padding:0 14px;gap:10px;
+  flex-shrink:0;z-index:5;
+}
+.tb-toggle{
+  background:none;border:none;color:var(--muted);
+  cursor:pointer;padding:6px 8px;border-radius:8px;
+  font-size:1.1rem;transition:color .2s,background .2s;flex-shrink:0;
+}
+.tb-toggle:hover{background:rgba(255,255,255,.08);color:var(--txt);}
+.tb-title{font-weight:600;font-size:.92rem;color:var(--txt);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.lang-row{display:flex;gap:3px;flex-shrink:0;}
+.lang-btn{
+  background:none;border:1px solid var(--bd);border-radius:7px;
+  padding:4px 7px;color:var(--muted);font-size:.72rem;cursor:pointer;
+  transition:all .2s;
+}
+.lang-btn.on{background:rgba(0,212,255,.12);color:var(--c1);border-color:rgba(0,212,255,.3);}
+
+/* ─ Page nav ─ */
+.page-nav{
+  display:flex;gap:0;padding:0 4px;
+  border-bottom:1px solid var(--bd);
+  background:rgba(10,10,16,.9);flex-shrink:0;
+  overflow-x:auto;
+}
+.page-nav::-webkit-scrollbar{height:0;}
+.pn-item{
+  padding:10px 13px;font-size:.8rem;font-weight:500;
+  color:var(--muted);cursor:pointer;border:none;background:none;
+  border-bottom:2px solid transparent;white-space:nowrap;
+  transition:color .2s,border-color .2s;
+}
+.pn-item:hover{color:var(--txt);}
+.pn-item.on{color:var(--c1);border-bottom-color:var(--c1);}
+
+/* ─ Content ─ */
+#content{flex:1;overflow-y:auto;position:relative;}
+#content::-webkit-scrollbar{width:4px;}
+#content::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:4px;}
+
+/* ==============================================
+   CHAT
+============================================== */
+.chat-wrap{max-width:800px;margin:0 auto;padding:20px 16px 100px;}
+
+/* welcome screen */
+.welcome-box{
+  display:flex;flex-direction:column;align-items:center;
+  justify-content:center;min-height:60vh;text-align:center;padding:32px 16px;
+}
+.welcome-box h2{font-size:1.4rem;color:var(--txt);margin:12px 0 6px;}
+.welcome-box p{color:var(--muted);font-size:.9rem;}
+
+/* chat messages */
+.msg-u{display:flex;justify-content:flex-end;margin:10px 0;}
+.msg-u .bbl{
+  background:linear-gradient(135deg,rgba(0,100,200,.5),rgba(0,212,255,.25));
+  border:1px solid rgba(0,212,255,.3);
+  border-radius:18px 18px 4px 18px;
+  padding:12px 16px;max-width:78%;color:#fff;
+  line-height:1.58;font-size:.92rem;word-wrap:break-word;
+}
+.msg-a{display:flex;gap:10px;margin:10px 0;align-items:flex-start;}
+.msg-a .ai-ic{
+  width:28px;height:28px;border-radius:50%;
+  background:linear-gradient(135deg,var(--c2),var(--c1));
+  display:flex;align-items:center;justify-content:center;
+  font-weight:800;font-size:.7rem;color:#fff;flex-shrink:0;margin-top:2px;
+}
+.msg-a .bbl{
+  background:var(--bg3);
+  border:1px solid rgba(139,92,246,.2);
+  border-radius:4px 18px 18px 18px;
+  padding:12px 16px;max-width:86%;
+  color:var(--txt);line-height:1.68;font-size:.92rem;word-wrap:break-word;
+}
+.msg-ts{font-size:.66rem;color:var(--muted);margin-top:4px;}
+
+/* mode + style bar */
+.mode-bar{
+  display:flex;gap:6px;flex-wrap:wrap;
+  padding:10px 16px 6px;max-width:800px;margin:0 auto;
+  border-bottom:1px solid rgba(255,255,255,.04);
+  flex-shrink:0;
+}
+.mode-chip{
+  padding:5px 13px;border-radius:20px;font-size:.78rem;font-weight:600;
+  border:1px solid var(--bd);color:var(--muted);background:none;cursor:pointer;
+  transition:all .2s;white-space:nowrap;
+}
+.mode-chip.on{background:rgba(0,212,255,.14);border-color:rgba(0,212,255,.38);color:var(--c1);}
+
+/* input bar */
+#inp-bar{
+  position:sticky;bottom:0;
+  background:rgba(10,10,16,.98);backdrop-filter:blur(12px);
+  border-top:1px solid var(--bd);padding:10px 16px 14px;
+  flex-shrink:0;
+}
+.inp-inner{max-width:800px;margin:0 auto;}
+
+/* ==============================================
+   UI COMPONENTS
+============================================== */
+.gc{
+  background:var(--glass);border:1px solid var(--bd);
+  border-radius:var(--r);padding:16px;
+  backdrop-filter:blur(10px);margin-bottom:12px;
+  transition:border-color .25s;
+}
+.gc:hover{border-color:rgba(0,212,255,.28);}
+
+.xo{background:rgba(255,255,255,.07);border-radius:20px;height:8px;overflow:hidden;margin:4px 0;}
+.xi{height:100%;border-radius:20px;background:linear-gradient(90deg,var(--c2),var(--c1));transition:width .8s;}
+
+.sc{background:var(--glass);border:1px solid var(--bd);border-radius:12px;padding:14px;text-align:center;}
+.sn{font-size:1.9rem;font-weight:700;
+  background:linear-gradient(135deg,var(--c1),var(--c2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+
+.bdg{display:inline-block;padding:3px 9px;border-radius:20px;font-size:.7rem;font-weight:600;
+  background:linear-gradient(135deg,var(--c2),var(--c1));color:#fff;margin:2px;}
+.pfree{background:linear-gradient(135deg,#3a3a4a,#555)!important;}
+.pstudent{background:linear-gradient(135deg,#d97706,#fbbf24)!important;}
+.ppro{background:linear-gradient(135deg,var(--c2),var(--c1))!important;}
+.pteacher{background:linear-gradient(135deg,#059669,#10b981)!important;}
+
+.ann{background:linear-gradient(135deg,rgba(0,212,255,.05),rgba(139,92,246,.05));
+  border-left:3px solid var(--c1);border-radius:8px;padding:10px 14px;margin:5px 0;}
+
+.fc{background:linear-gradient(135deg,rgba(0,212,255,.07),rgba(139,92,246,.07));
+  border:1px solid rgba(0,212,255,.22);border-radius:18px;
+  padding:32px;text-align:center;min-height:160px;
+  display:flex;align-items:center;justify-content:center;font-size:1.15rem;}
+
+/* ─ Login ─ */
+.login-page{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
+.login-box{
+  background:rgba(10,10,30,.96);border:1px solid rgba(0,212,255,.16);
+  border-radius:22px;padding:36px 32px;max-width:400px;width:100%;
+  backdrop-filter:blur(18px);box-shadow:0 20px 60px rgba(0,0,0,.7);
+}
+
+/* ─ Streamlit overrides ─ */
 .stButton>button{
   background:linear-gradient(135deg,var(--c2),var(--c1))!important;
-  color:#fff!important;border:none!important;border-radius:10px!important;
-  font-weight:600!important;padding:10px 24px!important;transition:opacity .2s!important;
+  color:#fff!important;border:none!important;border-radius:9px!important;
+  font-weight:600!important;transition:opacity .2s!important;
 }
-.stButton>button:hover{opacity:.85!important;}
-.stTextInput>div>div>input,
-.stTextArea>div>div>textarea{
+.stButton>button:hover{opacity:.82!important;}
+.stTextInput>div>div>input,.stTextArea>div>div>textarea{
   background:rgba(255,255,255,.05)!important;
   border:1px solid var(--bd)!important;
-  color:var(--txt)!important;border-radius:10px!important;
+  color:var(--txt)!important;border-radius:9px!important;
 }
-.stTabs [data-baseweb="tab"]{color:var(--m)!important;}
+.stTabs [data-baseweb="tab"]{color:var(--muted)!important;}
 .stTabs [aria-selected="true"]{color:var(--c1)!important;border-bottom:2px solid var(--c1)!important;}
-::-webkit-scrollbar{width:6px;}
-::-webkit-scrollbar-thumb{background:var(--c2);border-radius:4px;}
 [data-testid="metric-container"]{
-  background:var(--gl)!important;
-  border:1px solid var(--bd)!important;
-  border-radius:12px!important;padding:12px!important;
+  background:var(--glass)!important;border:1px solid var(--bd)!important;border-radius:11px!important;
 }
-@keyframes fl{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+::-webkit-scrollbar{width:4px;}
+::-webkit-scrollbar-thumb{background:var(--c2);border-radius:4px;}
+
+/* ─ Mobile ─ */
+@media(max-width:760px){
+  #sb{position:fixed;top:0;left:0;height:100vh;z-index:200;transform:translateX(0);}
+  #sb.hidden{transform:translateX(-260px);}
+  #mob-nav{
+    display:flex!important;
+    position:fixed;bottom:0;left:0;right:0;z-index:100;
+    background:rgba(10,10,20,.97);border-top:1px solid var(--bd);
+    padding:6px 0 calc(6px + env(safe-area-inset-bottom));
+    backdrop-filter:blur(16px);
+  }
+  .chat-wrap{padding-bottom:80px!important;}
+  #inp-bar{padding-bottom:calc(12px + env(safe-area-inset-bottom))!important;}
+  .page-nav{display:none!important;}
+}
+@media(min-width:761px){#mob-nav{display:none!important;}}
+.mn-item{
+  flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;
+  padding:5px 2px;color:var(--muted);font-size:.58rem;cursor:pointer;
+  border:none;background:none;transition:color .2s;
+}
+.mn-item.on{color:var(--c1);}
+.mn-item .ic{font-size:1.2rem;line-height:1.2;}
+
+/* ─ Animations ─ */
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+.fu{animation:fadeUp .35s ease forwards;}
+@keyframes fl{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
 .fl{animation:fl 3s ease-in-out infinite;display:inline-block;}
-@keyframes fu{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-.f1{animation:fu .5s ease forwards;}
-.f2{animation:fu .5s ease .15s forwards;opacity:0;}
-.f3{animation:fu .5s ease .3s forwards;opacity:0;}
+
+/* sb overlay for mobile */
+#sb-overlay{display:none;position:fixed;inset:0;z-index:190;background:rgba(0,0,0,.5);}
+@media(max-width:760px){
+  #sb-overlay.show{display:block;}
+}
 </style>""", unsafe_allow_html=True)
 
-
-# ── DATA ──────────────────────────────────────────────────────────────────────
-def _uid_from_email(email: str) -> str:
-    """Email dan deterministik UID yasash."""
+# ── DATA LAYER ────────────────────────────────────────────────────────────────
+def uid_of(email: str) -> str:
     return hashlib.md5(email.lower().encode()).hexdigest()[:12]
 
+def uf(uid): return Path(f"data/users/{uid}.json")
+def hf(uid, cid=None): return Path(f"data/history/{uid}{'_'+cid if cid else ''}.json")
 
-def uf(uid):  return Path(f"data/users/{uid}.json")
-def hf(uid):  return Path(f"data/history/{uid}.json")
-
-
-def load_user(uid: str):
-    """UID yoki email bo'yicha foydalanuvchini yuklash."""
-    # Agar email bo'lsa UID ga aylantiramiz
-    if "@" in uid:
-        uid = _uid_from_email(uid)
-    fp = uf(uid)
-    if fp.exists():
+def load_user(uid: str) -> dict:
+    if "@" in uid: uid = uid_of(uid)
+    p = uf(uid)
+    if p.exists():
         try:
-            with open(fp, encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
+            with open(p, encoding="utf-8") as f: return json.load(f)
+        except: pass
     return {
-        "id": uid, "name": "", "email": "", "avatar": "",
-        "created": datetime.datetime.now().isoformat(),
-        "xp": 0, "level": 1, "badges": [], "test_scores": [],
-        "mood_history": [], "streak": 0,
-        "last_active": datetime.date.today().isoformat(),
-        "total_messages": 0, "topics": {}, "flashcards": [],
-        "daily_q": 0, "daily_date": "",
-        "monthly_t": 0, "monthly_date": "",
-        "premium": "free", "premium_exp": "",
-        "password": "",
-        "settings": {"ai_style": "o'qituvchi"}
+        "id":uid,"name":"","email":"","avatar":"",
+        "created":datetime.datetime.now().isoformat(),
+        "xp":0,"badges":[],"test_scores":[],
+        "mood_history":[],"streak":0,
+        "last_active":datetime.date.today().isoformat(),
+        "total_messages":0,"topics":{},"flashcards":[],
+        "daily_q":0,"daily_date":"",
+        "monthly_t":0,"monthly_date":"",
+        "premium":"free","premium_exp":"",
+        "password":"","lang":"uz",
+        "settings":{"ai_style":"o'qituvchi"},
+        "chats":[],"active_chat":None,
     }
-
 
 def save_user(u: dict):
     with open(uf(u["id"]), "w", encoding="utf-8") as f:
         json.dump(u, f, ensure_ascii=False, indent=2)
 
-
-def load_hist(uid: str):
-    fp = hf(uid)
-    if fp.exists():
+def load_hist(uid: str, cid=None) -> list:
+    p = hf(uid, cid)
+    if p.exists():
         try:
-            with open(fp, encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
+            with open(p, encoding="utf-8") as f: return json.load(f)
+        except: pass
     return []
 
-
-def save_hist(uid: str, h: list):
-    with open(hf(uid), "w", encoding="utf-8") as f:
+def save_hist(uid: str, h: list, cid=None):
+    with open(hf(uid, cid), "w", encoding="utf-8") as f:
         json.dump(h, f, ensure_ascii=False, indent=2)
 
-
-def add_msg(uid: str, role: str, content: str):
-    """Xabar qo'shib, yangilangan tarixni qaytaradi."""
-    h = load_hist(uid)
-    h.append({
-        "role": role,
-        "content": content,
-        "ts": datetime.datetime.now().isoformat()
-    })
-    save_hist(uid, h)
+def push_msg(uid: str, role: str, text: str, cid=None) -> list:
+    h = load_hist(uid, cid)
+    h.append({"role":role,"content":text,"ts":datetime.datetime.now().isoformat()})
+    save_hist(uid, h, cid)
     return h
 
-
-def all_users():
-    us = []
-    for fp in Path("data/users").glob("*.json"):
+def all_users() -> list:
+    res = []
+    for p in Path("data/users").glob("*.json"):
         try:
-            with open(fp, encoding="utf-8") as f:
-                us.append(json.load(f))
-        except:
-            pass
-    return us
+            with open(p, encoding="utf-8") as f: res.append(json.load(f))
+        except: pass
+    return res
 
-
-def load_ann():
-    fp = Path("data/announce/list.json")
-    if fp.exists():
+def load_ann() -> list:
+    p = Path("data/announce/list.json")
+    if p.exists():
         try:
-            with open(fp, encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
+            with open(p, encoding="utf-8") as f: return json.load(f)
+        except: pass
     return []
 
-
-def save_ann(lst: list):
-    with open("data/announce/list.json", "w", encoding="utf-8") as f:
+def save_ann(lst):
+    with open("data/announce/list.json","w",encoding="utf-8") as f:
         json.dump(lst, f, ensure_ascii=False, indent=2)
 
+# ── SESSION ───────────────────────────────────────────────────────────────────
+def mk_token(uid: str) -> str:
+    token = hashlib.sha256(f"{uid}_{datetime.date.today()}_{uuid.uuid4()}".encode()).hexdigest()
+    with open(f"data/sessions/{token}.json","w") as f:
+        json.dump({"uid":uid,"date":datetime.date.today().isoformat()}, f)
+    return token
+
+def chk_token(token: str):
+    if not token: return None
+    p = Path(f"data/sessions/{token}.json")
+    if not p.exists(): return None
+    try:
+        with open(p) as f: d = json.load(f)
+        age = (datetime.date.today() - datetime.date.fromisoformat(d.get("date","2000-01-01"))).days
+        if age > 7: p.unlink(); return None
+        return d.get("uid")
+    except: return None
 
 # ── PREMIUM ───────────────────────────────────────────────────────────────────
-def is_prem(u: dict) -> bool:
-    p = u.get("premium", "free")
-    if p == "free":
-        return False
-    exp = u.get("premium_exp", "")
+def is_prem(u):
+    p = u.get("premium","free")
+    if p == "free": return False
+    exp = u.get("premium_exp","")
     if exp:
         try:
             if datetime.date.fromisoformat(exp) < datetime.date.today():
-                u["premium"] = "free"
-                save_user(u)
-                return False
-        except:
-            pass
-    return p in ["student", "pro", "teacher"]
+                u["premium"]="free"; save_user(u); return False
+        except: pass
+    return p in ["student","pro","teacher"]
 
+def get_plan(u): return u.get("premium","free")
+def is_admin(u): return u.get("email","") in ADMIN_EMAILS
 
-def get_plan(u: dict) -> str:
-    return u.get("premium", "free")
-
-
-def can_ask(u: dict) -> bool:
-    if is_prem(u):
-        return True
+def can_ask(u):
+    if is_prem(u): return True
     today = datetime.date.today().isoformat()
-    if u.get("daily_date") != today:
-        u["daily_q"] = 0
-        u["daily_date"] = today
-        save_user(u)
-    return u.get("daily_q", 0) < FREE_Q_LIMIT
+    if u.get("daily_date") != today: u["daily_q"]=0; u["daily_date"]=today; save_user(u)
+    return u.get("daily_q",0) < FREE_Q
 
-
-def inc_daily(u: dict):
-    u["daily_q"] = u.get("daily_q", 0) + 1
-    save_user(u)
-
-
-def is_admin(u: dict) -> bool:
-    return u.get("email", "") in ADMIN_EMAILS
-
+def inc_q(u): u["daily_q"]=u.get("daily_q",0)+1; save_user(u)
 
 # ── GAMIFICATION ──────────────────────────────────────────────────────────────
-LVS    = [0, 100, 250, 500, 900, 1400, 2100, 3000, 4200, 5800, 8000]
-LNAMES = [
-    "Yangi boshlovchi", "Talaba", "Izlanuvchi", "Bilimdon",
-    "Ekspert", "Master", "Ustoz", "Akademik", "Professor", "Dono", "Inson AI"
-]
+LVS = [0,100,250,500,900,1400,2100,3000,4200,5800,8000]
+LN = {
+    "uz":["Yangi boshlovchi","Talaba","Izlanuvchi","Bilimdon","Ekspert",
+          "Master","Ustoz","Akademik","Professor","Dono","Inson AI"],
+    "en":["Newcomer","Student","Explorer","Scholar","Expert",
+          "Master","Mentor","Academic","Professor","Sage","AI Human"],
+    "ru":["Новичок","Студент","Исследователь","Знаток","Эксперт",
+          "Мастер","Наставник","Академик","Профессор","Мудрец","Человек ИИ"],
+}
 BDGS = {
-    "birinchi_qadam": {"e": "🚀", "n": "Birinchi qadam", "t": "Birinchi suhbat"},
-    "faol":           {"e": "📚", "n": "Faol o'quvchi",  "t": "50 xabar"},
-    "test_ustasi":    {"e": "🏆", "n": "Test ustasi",    "t": "5 test"},
-    "streak_7":       {"e": "🔥", "n": "7 kun streak",   "t": "7 kun ketma-ket"},
-    "bilimdon":       {"e": "🎓", "n": "Bilimdon",       "t": "500 XP"},
-    "premium":        {"e": "💎", "n": "Premium",        "t": "Premium obuna"},
-    "flash_master":   {"e": "🃏", "n": "Flashcard usta", "t": "50 karta"},
-    "turnir":         {"e": "🥇", "n": "Turnir g'olibi", "t": "Turnirda 1-o'rin"},
+    "start":  {"e":"🚀","n":"Birinchi qadam","t":"1-suhbat"},
+    "active": {"e":"📚","n":"Faol o'quvchi", "t":"50 xabar"},
+    "tester": {"e":"🏆","n":"Test ustasi",   "t":"5 test"},
+    "streak": {"e":"🔥","n":"7 kun streak",  "t":"7 kun ketma-ket"},
+    "scholar":{"e":"🎓","n":"Bilimdon",      "t":"500 XP"},
+    "prem":   {"e":"💎","n":"Premium",       "t":"Premium obuna"},
+    "champ":  {"e":"🥇","n":"Turnir g'olibi","t":"Turnirda 1-o'rin"},
 }
 
-
-def get_lv(xp: int):
+def lv_info(xp: int, lang="uz"):
     lv = 1
-    for i, t in enumerate(LVS):
-        if xp >= t:
-            lv = i + 1
-    lv = min(lv, len(LNAMES))
-    return lv, LNAMES[lv - 1], LVS[lv - 1], LVS[lv] if lv < len(LVS) else LVS[-1] + 1000
+    for i,v in enumerate(LVS):
+        if xp >= v: lv = i+1
+    lv = min(lv, len(LVS))
+    names = LN.get(lang, LN["uz"])
+    name  = names[lv-1]
+    cur   = LVS[lv-1]
+    nxt   = LVS[lv] if lv < len(LVS) else LVS[-1]+1000
+    return lv, name, cur, nxt
 
+def add_xp(u, n):
+    lang = st.session_state.get("lang","uz")
+    old = lv_info(u["xp"], lang)[0]
+    u["xp"] = u.get("xp",0) + n
+    new = lv_info(u["xp"], lang)[0]
+    if new > old: st.balloons(); st.success(f"🎉 {lv_info(u['xp'],lang)[1]} darajasiga ko'tarildingiz!")
+    save_user(u); return u
 
-def add_xp(u: dict, n: int):
-    old = get_lv(u["xp"])[0]
-    u["xp"] = u.get("xp", 0) + n
-    new = get_lv(u["xp"])[0]
-    if new > old:
-        st.balloons()
-        st.success(f"🎉 {LNAMES[new - 1]} darajasiga ko'tarildingiz!")
-    save_user(u)
-    return u
-
-
-def chk_bdg(u: dict):
-    e = set(u.get("badges", []))
-    hl = len(load_hist(u["id"]))
-    checks = [
-        ("birinchi_qadam", hl >= 1),
-        ("faol",           u.get("total_messages", 0) >= 50),
-        ("test_ustasi",    len(u.get("test_scores", [])) >= 5),
-        ("bilimdon",       u.get("xp", 0) >= 500),
-        ("premium",        is_prem(u)),
-    ]
-    for bid, cond in checks:
+def chk_bdg(u):
+    e = set(u.get("badges",[]))
+    cid = u.get("active_chat")
+    hl  = len(load_hist(u["id"], cid))
+    for bid, cond in [
+        ("start",  hl >= 1),
+        ("active", u.get("total_messages",0) >= 50),
+        ("tester", len(u.get("test_scores",[])) >= 5),
+        ("scholar",u.get("xp",0) >= 500),
+        ("prem",   is_prem(u)),
+    ]:
         if cond and bid not in e:
-            e.add(bid)
-            st.toast(f"{BDGS[bid]['e']} Badge: {BDGS[bid]['n']}!", icon="🏅")
-    u["badges"] = list(e)
-    save_user(u)
-    return u
+            e.add(bid); st.toast(f"{BDGS[bid]['e']} {BDGS[bid]['n']}!", icon="🏅")
+    u["badges"] = list(e); save_user(u); return u
 
-
-def upd_streak(u: dict):
+def upd_streak(u):
     today = datetime.date.today().isoformat()
-    yest  = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
-    last  = u.get("last_active", "")
-    if last == today:
-        return u
-    u["streak"] = u.get("streak", 0) + 1 if last == yest else 1
+    yest  = (datetime.date.today()-datetime.timedelta(1)).isoformat()
+    last  = u.get("last_active","")
+    if last == today: return u
+    u["streak"] = u.get("streak",0)+1 if last==yest else 1
     u["last_active"] = today
-    if u["streak"] >= 7 and "streak_7" not in u.get("badges", []):
-        u.setdefault("badges", []).append("streak_7")
-        st.toast("🔥 7 kun streak!", icon="🏅")
-    save_user(u)
-    return u
+    if u["streak"]>=7 and "streak" not in u.get("badges",[]):
+        u.setdefault("badges",[]).append("streak"); st.toast("🔥 7 kun streak!",icon="🏅")
+    save_user(u); return u
 
+# ── CHAT MGMT ────────────────────────────────────────────────────────────────
+def new_chat(u) -> str:
+    cid = uuid.uuid4().hex[:8]
+    u.setdefault("chats",[]).insert(0, {
+        "id":cid,"title":"Yangi suhbat",
+        "created":datetime.datetime.now().isoformat(),
+        "updated":datetime.datetime.now().isoformat(),
+    })
+    u["active_chat"] = cid
+    save_user(u); return cid
+
+def set_chat_title(u, cid, first_msg):
+    title = first_msg[:38]+("…" if len(first_msg)>38 else "")
+    for c in u.get("chats",[]):
+        if c["id"]==cid: c["title"]=title; c["updated"]=datetime.datetime.now().isoformat(); break
+    save_user(u)
+
+def chat_groups(chats):
+    today     = datetime.date.today()
+    yesterday = today - datetime.timedelta(1)
+    g = {"today":[],"yesterday":[],"older":[]}
+    for c in chats:
+        try: d = datetime.date.fromisoformat(c.get("updated","")[:10])
+        except: d = today
+        if d==today: g["today"].append(c)
+        elif d==yesterday: g["yesterday"].append(c)
+        else: g["older"].append(c)
+    return g
 
 # ── AI ────────────────────────────────────────────────────────────────────────
-def gcl():
-    if not GROQ_API_KEY:
-        st.error("❌ GROQ_API_KEY topilmadi! .env faylini tekshiring.")
-        return None
-    return Groq(api_key=GROQ_API_KEY)
+def sys_prompt(u, mode="chat") -> str:
+    lang = u.get("lang","uz")
+    lv, name, _, _ = lv_info(u.get("xp",0), lang)
+    style  = u.get("settings",{}).get("ai_style","o'qituvchi")
+    mood   = (u.get("mood_history",[{}])[-1].get("mood","neytral") if u.get("mood_history") else "neytral")
+    plan   = get_plan(u)
 
+    lang_rules = {
+        "uz": "MAJBURIY: FAQAT O'ZBEK TILIDA javob ber (boshqa til so'ramasa)",
+        "en": "MANDATORY: ALWAYS respond in ENGLISH only",
+        "ru": "OBYAZATELNO: VSEGDA otvechay tolko na RUSSKOM YAZYKE",
+    }
+    lang_rule = lang_rules.get(lang, lang_rules["uz"])
+    uname = u.get("name") or "Oquvchi"
 
-def sys_p(u: dict, mode: str = "chat") -> str:
-    lv, ln, _, _ = get_lv(u.get("xp", 0))
-    style = u.get("settings", {}).get("ai_style", "o'qituvchi")
-    mood  = (u.get("mood_history", [{}])[-1].get("mood", "neytral")
-             if u.get("mood_history") else "neytral")
-    plan = get_plan(u)
-    pe   = PLANS.get(plan, {}).get("emoji", "🆓")
-    base = f""" EduAI UZ — O'zbekistonning eng ilg'or AI ta'lim yordamchisissan.
-
-FOYDALANUVCHI: {u.get('name','')}, {ln} (Lv.{lv}), Kayfiyat:{mood}, Uslub:{style}, {pe} {plan.upper()}
-
-ASOSIY QOIDALAR:
-1. FAQAT O'ZBEK TILIDA javob ber (so'rasagina boshqa til)
-2. Aniq, tushunarli, ilmiy to'g'ri javoblar
-3. Misollar, analogiyalar va markdown bilan tushuntir
-4. Bosqichma-bosqich o'rgat
-5. Foydalanuvchini rag'batlantir va motivatsiya ber
-6. Emoji'lardan o'rinli foydalan: ✅❌📌💡⚡🔬🧮📐🎯
-7. Kayfiyatga mos: xursand→energetik, xafa→yumshoq, stressli→oddiy
-8. Har javob oxirida 1-2 qiziqarli savol ber
-9. Premium foydalanuvchilarga chuqurroq va batafsil javob ber
-10. Matematik hisoblashda bosqichlarni ko'rsat"""
+    p = (
+        "Sen EduAI UZ - O'zbekistonning eng kuchli AI ta'lim yordamchisissan.\n"
+        "Sen dunyadagi eng yaxshi AI o'qituvchisan.\n\n"
+        "=== FOYDALANUVCHI ===\n"
+        "Ism: " + uname + " | Daraja: " + name + " (Lv." + str(lv) + ")"
+        " | Kayfiyat: " + mood + " | Uslub: " + style + " | Plan: " + plan.upper() + "\n\n"
+        "=== ASOSIY QOIDALAR ===\n"
+        "1. " + lang_rule + "\n"
+        "2. Har doim ANIQ, ILMIY TO'G'RI ma'lumot ber\n"
+        "3. Murakkab narsalarni ODDIY misollar bilan tushuntir\n"
+        "4. BOSQICHMA-BOSQICH o'rgat (step-by-step)\n"
+        "5. Foydalanuvchini rag'batlantir, xatolarni muloyimlik bilan to'g'irla\n"
+        "6. MARKDOWN ishlatuvchi: sarlavhalar, jadvallar, kod bloklari\n"
+        "7. O'rinli emojilar: ok noto'g'ri eslatma yulduz chiroq\n"
+        "8. Kayfiyatga mos: xursand=energetik, xafa=yumshoq, stressli=tinchlantiruvchi\n"
+        "9. Har javob oxirida 1-2 ta qiziqarli savol ber\n"
+        "10. Premium: chuqurroq tahlil + ko'proq misol + amaliy topshiriqlar\n"
+        "11. Matematik hisoblashlarda barcha qadamlarni ko'rsat\n"
+        "12. Dasturlashda: kod ``` ichida, xatolarni aniqla\n\n"
+        "=== JAVOB SIFATI ===\n"
+        "- Kirish, asosiy tushuntirish, misol, xulosa, savol\n"
+        "- Kamida 3-5 asosiy nuqta\n"
+        "- Hayotiy va amaliy misollar\n"
+        "- SUPER AI darajasida javob ber - har doim MAKSIMAL YORDAM!"
+    )
 
     if mode == "konspekt":
-        base += """
-
-REJIM: KONSPEKT YARATISH
-## 📌 [Mavzu nomi]
-### 🔑 Asosiy tushunchalar
-### 📋 Muhim qoidalar
-### 💡 Misollar
-### 🧮 Formulalar
-### ❓ O'z-o'zini tekshirish (3-5 savol)"""
+        p += (
+            "\n\n=== REJIM: KONSPEKT ===\n"
+            "# [Mavzu nomi]\n"
+            "## Asosiy tushunchalar va ta'riflar\n"
+            "## Muhim qoidalar\n"
+            "## Misollar va amaliy qo'llash\n"
+            "## Formulalar / Algoritmlar\n"
+            "## Taqqoslash jadvali\n"
+            "## O'z-o'zini tekshirish (5-7 savol)\n"
+            "## Qo'shimcha manbalar"
+        )
     elif mode == "test":
-        base += """
-
-REJIM: TEST — FAQAT JSON qaytargin (boshqa hech narsa yozma):
-[{"savol":"...","variantlar":["A) ...","B) ...","C) ...","D) ..."],"togri_javob":"A","izoh":"..."}]"""
+        p += (
+            "\n\nREJIM: TEST - FAQAT sof JSON qaytargin (boshqa hech narsa yozma):\n"
+            "[{\"savol\":\"...\",\"variantlar\":[\"A) ...\",\"B) ...\",\"C) ...\",\"D) ...\"],"
+            "\"togri_javob\":\"A\",\"izoh\":\"...\"}]"
+        )
     elif mode == "mental":
-        base += """
-
-REJIM: KAYFIYAT TAHLIL — FAQAT JSON (boshqa hech narsa yozma):
-{"kayfiyat":"xursand|neytral|xafa|stressli","daraja":1-10,"sabab":"...","maslahat":"..."}"""
+        p += (
+            "\n\nREJIM: KAYFIYAT - FAQAT sof JSON:\n"
+            "{\"kayfiyat\":\"xursand|neytral|xafa|stressli\",\"daraja\":5,\"sabab\":\"...\",\"maslahat\":\"...\"}"
+        )
     elif mode == "kod":
-        base += """
-
-REJIM: DASTURLASH O'QITUVCHISI
-Kodni tushuntir, xatolarni aniqla, yaxshilanishlar tavsiya qil. ``` ichida yoz."""
-    return base
-
-
-def ask_ai(u: dict, msgs: list, mode: str = "chat", ctx: str = "") -> str:
-    cl = gcl()
-    if not cl:
-        return "AI bilan bog'lanib bo'lmadi."
-    sp = sys_p(u, mode)
-    if ctx:
-        sp += f"\n\nQO'SHIMCHA:\n{ctx}"
-    recent = msgs[-30:]
-    api_msgs = [{"role": "system", "content": sp}]
-    for m in recent:
-        api_msgs.append({
-            "role": "user" if m["role"] == "user" else "assistant",
-            "content": m["content"]
-        })
-    try:
-        r = Groq(api_key=GROQ_API_KEY).chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=api_msgs,
-            temperature=0.75,
-            max_tokens=3000
+        p += (
+            "\n\nREJIM: DASTURLASH - kodni ``` ichida yoz, "
+            "har satrni tushuntir, xatolarni aniqla."
         )
-        return r.choices[0].message.content
-    except Exception as e:
-        return f"❌ Xato: {e}"
+
+    return p
 
 
-def mood_ai(u: dict, text: str) -> dict:
+def call_json(u, prompt, mode="test", max_tok=3000) -> str:
+    if not api_key: return "[]"
     try:
-        r = Groq(api_key=GROQ_API_KEY).chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": sys_p(u, "mental")},
-                {"role": "user",   "content": f"Tahlil: {text}"}
-            ],
-            temperature=0.3, max_tokens=256
-        )
-        raw = re.sub(r"```json|```", "", r.choices[0].message.content).strip()
-        return json.loads(raw)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Tizim ko'rsatmasi va foydalanuvchi so'rovini birlashtirish
+        full_prompt = f"{sys_prompt(u, mode)}\n\nFoydalanuvchi so'rovi: {prompt}"
+        
+        response = model.generate_content(full_prompt)
+        raw = response.text
+        
+        # JSONni tozalash (re.sub qismi o'sha holicha qolsa ham bo'ladi)
+        raw = re.sub(r"```json\s?|\s?```", "", raw).strip()
+        
+        # Sizning JSON qidirish mantiqingiz...
+        for bra in ["[", "{"]:
+            s = raw.find(bra)
+            e = raw.rfind("]" if bra=="[" else "}")+1
+            if s>=0 and e>s: return raw[s:e]
+        return raw
+    except: return "[]"
+
+def mood_of(u, text) -> dict:
+    raw = call_json(u, f"Tahlil: {text}", "mental", 256)
+    try: return json.loads(raw)
+    except: return {"kayfiyat":"neytral","daraja":5,"sabab":"","maslahat":"Yaxshi kun!"}
+
+def gen_test(u, topic, n=5) -> list:
+    raw = call_json(u, f"'{topic}' bo'yicha {n} ta sifatli test savoli yar.", "test", 3000)
+    try: return json.loads(raw)
+    except: return []
+
+def gen_konspekt(u, hist) -> str:
+    if not hist: return "Suhbat tarixi yo'q."
+    txt = "\n".join([m["role"].upper() + ": " + m["content"] for m in hist[-20:]])
+    msg = "Konspekt yar:\n" + txt
+    return call_ai(u, [{"role":"user","content":msg}], "konspekt")
+
+def gen_flash(u, topic, n=10) -> list:
+    fmt = '[{"savol":"...","javob":"..."}]'
+    p1 = topic + ' -- ' + str(n) + " ta flashcard. O'zbek tilida."
+    p2 = topic + ' boyicha ' + str(n) + ' ta flashcard yar. Format: ' + fmt
+    raw  = call_json(u, p1, 'test', 2000)
+    raw2 = call_json(u, p2, 'mental', 2000)
+    try: return json.loads(raw2)
     except:
-        return {"kayfiyat": "neytral", "daraja": 5, "sabab": "", "maslahat": "Yaxshi kun!"}
+        try: return json.loads(raw)
+        except: return []
 
 
-def gen_test(u: dict, mavzu: str, n: int = 5) -> list:
-    try:
-        r = Groq(api_key=GROQ_API_KEY).chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": sys_p(u, "test")},
-                {"role": "user",   "content": f"'{mavzu}' bo'yicha {n} ta test savoli."}
-            ],
-            temperature=0.7, max_tokens=3000
-        )
-        raw = re.sub(r"```json|```", "", r.choices[0].message.content).strip()
-        return json.loads(raw)
-    except:
-        return []
+# ── BOOKS ─────────────────────────────────────────────────────────────────────
+def load_books():
+    p = Path("data/books/list.json")
+    if p.exists():
+        try:
+            with open(p,encoding="utf-8") as f: return json.load(f)
+        except: pass
+    return []
 
+def save_books(books):
+    with open("data/books/list.json","w",encoding="utf-8") as f:
+        json.dump(books, f, ensure_ascii=False, indent=2)
 
-def gen_konspekt(u: dict, hist: list) -> str:
-    if not hist:
-        return "Suhbat tarixi yo'q."
-    txt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in hist[-20:]])
-    try:
-        r = Groq(api_key=GROQ_API_KEY).chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": sys_p(u, "konspekt")},
-                {"role": "user",   "content": f"Konspekt:\n{txt}"}
-            ],
-            temperature=0.5, max_tokens=2500
-        )
-        return r.choices[0].message.content
-    except Exception as e:
-        return f"Xato: {e}"
+BOOK_CATS = ["📐 Matematika","🔬 Fizika","🧪 Kimyo","🧬 Biologiya",
+             "💻 Informatika","🌍 Tarix","📖 Adabiyot","🌐 Ingliz tili"]
 
+# ── SIDEBAR HTML ──────────────────────────────────────────────────────────────
+def sb_html(u) -> str:
+    lang   = st.session_state.get("lang","uz")
+    lv,nm,cur,nxt = lv_info(u.get("xp",0), lang)
+    xp     = u.get("xp",0)
+    pct    = min((xp-cur)/max(nxt-cur,1)*100, 100)
+    plan   = get_plan(u)
+    pi     = PLANS.get(plan,{})
+    init   = (u.get("name","?") or "?")[0].upper()
+    active = u.get("active_chat","")
+    chats  = u.get("chats",[])
+    grps   = chat_groups(chats)
 
-def gen_flash(u: dict, mavzu: str, n: int = 10) -> list:
-    try:
-        r = Groq(api_key=GROQ_API_KEY).chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": 'Faqat JSON qaytargin: [{"savol":"...","javob":"..."}]'},
-                {"role": "user",   "content": f"'{mavzu}' — {n} ta flashcard. O'zbek tilida."}
-            ],
-            temperature=0.7, max_tokens=2000
-        )
-        raw = re.sub(r"```json|```", "", r.choices[0].message.content).strip()
-        return json.loads(raw)
-    except:
-        return []
+    hist_html = ""
+    for gk, glbl in [("today",t("today")),("yesterday",t("yesterday")),("older",t("older"))]:
+        items = grps.get(gk,[])
+        if not items: continue
+        hist_html += f"<div class='sb-date'>{glbl}</div>"
+        for c in items:
+            cls = "sb-item active" if c["id"]==active else "sb-item"
+            cid_v = c["id"]
+            ctitle_v = c.get("title", "...")
+            hist_html += "<div class='" + cls + "' onclick='pickChat(\"" + cid_v + "\")'" + ">" + ctitle_v + "</div>"
+    if not hist_html:
+        hist_html = f"<div style='color:var(--muted);font-size:.78rem;padding:12px 8px;'>{t('welcome_sub')}</div>"
 
+    return f"""<div id="sb">
+  <div class="sb-top">
+    <div class="sb-brand">
+      <span style="font-size:1.25rem;">🎓</span>
+      <span class="sb-brand-txt">EduAI UZ</span>
+    </div>
+    <button class="sb-new-btn" onclick="doNewChat()">
+      <span style="font-size:1rem;">✏️</span> {t('new_chat')}
+    </button>
+  </div>
+  <div class="sb-search">
+    <input id="sb-srch" type="text" placeholder="{t('search')}" oninput="sbFilter(this.value)"/>
+  </div>
+  <div class="sb-hist" id="sb-hist">{hist_html}</div>
+  <div class="sb-foot">
+    <div class="sb-user">
+      <div class="sb-avatar">{init}</div>
+      <div style="flex:1;min-width:0;">
+        <div style="font-weight:600;font-size:.84rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{u.get('name','')}</div>
+        <div style="font-size:.7rem;color:var(--muted);">Lv.{lv} · {xp} XP · 🔥{u.get('streak',0)}</div>
+      </div>
+      <span class="bdg p{plan}" style="font-size:.62rem;">{pi.get('emoji','')}</span>
+    </div>
+    <div class="xbar"><div class="xbar-fill" style="width:{pct:.0f}%;"></div></div>
+  </div>
+</div>
+<div id="sb-overlay" onclick="closeSb()"></div>"""
 
-# ── GOOGLE AUTH ───────────────────────────────────────────────────────────────
-def g_url() -> str:
-    """Google OAuth login URL yasash."""
-    if not GOOGLE_CLIENT_ID:
-        return ""
-    params = {
-        "client_id":     GOOGLE_CLIENT_ID,
-        "redirect_uri":  REDIRECT_URI,
-        "response_type": "code",
-        "scope":         "openid email profile",
-        "access_type":   "offline",
-        "prompt":        "select_account",
-    }
-    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+# ── APP SHELL HTML ────────────────────────────────────────────────────────────
+def shell_html(u, page):
+    lang = st.session_state.get("lang","uz")
+    pages = [
+        ("chat","💬",t("chat")),("analytics","📊",t("analytics")),
+        ("tests","📝",t("tests")),("flashcard","🃏",t("flashcard")),
+        ("tournament","🏆",t("tournament")),("library","📚",t("library")),
+        ("books","📖",t("books")),("premium","💎",t("premium")),
+        ("settings","⚙️",t("settings")),
+    ]
+    if is_admin(u): pages.append(("admin","🛡️",t("admin")))
 
+    nav_parts = []
+    for k, em, lb in pages:
+        cls = "on" if page == k else ""
+        nav_parts.append('<button class="pn-item ' + cls + '" onclick="goPage(\'' + k + '\')">' + em + " " + lb + '</button>')
+    nav = "".join(nav_parts)
 
-def g_token(code: str) -> dict | None:
-    """Authorization code ni access token bilan almashtirish."""
-    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        return None
-    try:
-        r = requests.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "code":          code,
-                "client_id":     GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "redirect_uri":  REDIRECT_URI,
-                "grant_type":    "authorization_code",
-            },
-            timeout=15
-        )
-        return r.json() if r.ok else None
-    except:
-        return None
+    mob_parts = []
+    for k, em, lb in pages[:6]:
+        cls = "on" if page == k else ""
+        mob_parts.append('<button class="mn-item ' + cls + '" onclick="goPage(\'' + k + '\')" title="' + lb + '"><span class="ic">' + em + '</span><span>' + lb + '</span></button>')
+    mob = "".join(mob_parts)
 
+    flag_map = {"uz": "🇺🇿", "en": "🇬🇧", "ru": "🇷🇺"}
+    lbs_parts = []
+    for c in ["uz", "en", "ru"]:
+        cls = "on" if lang == c else ""
+        lbs_parts.append('<button class="lang-btn ' + cls + '" onclick="setLang(\'' + c + '\')">' + flag_map[c] + '</button>')
+    lbs = "".join(lbs_parts)
 
-def g_info(access_token: str) -> dict | None:
-    """Access token bilan foydalanuvchi ma'lumotini olish."""
-    try:
-        r = requests.get(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10
-        )
-        return r.json() if r.ok else None
-    except:
-        return None
+    titles = {k:lb for k,_,lb in pages}
+    title  = titles.get(page, "EduAI UZ")
 
+    return f"""
+{sb_html(u)}
+<div id="main">
+  <div id="topbar">
+    <button class="tb-toggle" onclick="toggleSb()">☰</button>
+    <span class="tb-title">{title}</span>
+    <div class="lang-row">{lbs}</div>
+  </div>
+  <div class="page-nav">{nav}</div>
+  <div id="content">
+</div><!-- #content opened, Streamlit content goes here -->
+<div id="mob-nav">{mob}</div>
+<script>
+var SB_OPEN = true;
+function toggleSb(){{
+  var sb=document.getElementById('sb');
+  var ov=document.getElementById('sb-overlay');
+  if(sb.classList.contains('hidden')){{sb.classList.remove('hidden');if(window.innerWidth<=760){{ov.classList.add('show');}}}}
+  else{{sb.classList.add('hidden');ov.classList.remove('show');}}
+}}
+function closeSb(){{document.getElementById('sb').classList.add('hidden');document.getElementById('sb-overlay').classList.remove('show');}}
+function doNewChat(){{setParam('action','new_chat');}}
+function pickChat(id){{setParam('chat_id',id);}}
+function goPage(pg){{setParam('page',pg);}}
+function setLang(l){{setParam('lang',l);}}
+function setParam(k,v){{
+  var url=new URL(window.parent.location.href);
+  // clear action after use
+  if(k!='action')url.searchParams.delete('action');
+  url.searchParams.set(k,v);
+  window.parent.history.replaceState(null,'',url);
+  window.parent.location.reload();
+}}
+function sbFilter(q){{
+  document.querySelectorAll('.sb-item').forEach(function(el){{
+    el.style.display=el.textContent.toLowerCase().includes(q.toLowerCase())?'':'none';
+  }});
+}}
+// Close sidebar on mobile by default
+if(window.innerWidth<=760){{document.getElementById('sb').classList.add('hidden');}}
+</script>"""
 
-def g_callback() -> dict | None:
-    """
-    Google OAuth callback:
-      - URL dan 'code' parametrini oladi
-      - Token bilan almashtiradi
-      - Foydalanuvchi ma'lumotini yuklaydi yoki yangi yaratadi
-      - User dict qaytaradi, xato bo'lsa None
-    """
-    code = st.query_params.get("code", "")
-    if not code:
-        st.session_state["auth_msg"] = "Code topilmadi"
-        return None
+# ─────────────────────────────────────────────────────────────────────────────
+# ── LOGIN PAGE ────────────────────────────────────────────────────────────────
+def page_login():
+    lang = st.session_state.get("lang","uz")
 
-    # 1. Token olish
-    td = g_token(code)
-    if not td:
-        st.session_state["auth_msg"] = "Token server javobi yo'q"
-        return None
-    if "access_token" not in td:
-        err = td.get("error_description", td.get("error", "Token xatosi"))
-        st.session_state["auth_msg"] = f"Token xatosi: {err}"
-        return None
+    st.markdown('<div class="login-page"><div class="login-box fu">', unsafe_allow_html=True)
 
-    # 2. Foydalanuvchi ma'lumotlari
-    info = g_info(td["access_token"])
-    if not info:
-        st.session_state["auth_msg"] = "Google profil olinmadi"
-        return None
-    if "email" not in info:
-        st.session_state["auth_msg"] = f"Email yo'q. Info: {info}"
-        return None
-
-    # 3. Foydalanuvchini yuklash yoki yangi yaratish
-    uid = _uid_from_email(info["email"])
-    u   = load_user(uid)
-    u.update({
-        "name":   info.get("name", "Foydalanuvchi"),
-        "email":  info.get("email", ""),
-        "avatar": info.get("picture", ""),
-        "id":     uid,
-    })
-    save_user(u)
-    return u
-
-
-def demo_login(name: str = "O'quvchi") -> dict:
-    """Demo (mehmon) kirish."""
-    uid = _uid_from_email(f"demo_{name}_{datetime.date.today()}")
-    u   = load_user(uid)
-    u.update({
-        "name":   name,
-        "email":  f"demo_{uid}@eduai.uz",
-        "id":     uid,
-        "avatar": f"https://ui-avatars.com/api/?name={name}&background=0D8ABC&color=fff",
-    })
-    save_user(u)
-    return u
-
-
-# ── LOGIN ─────────────────────────────────────────────────────────────────────
-def render_login():
-    st.markdown("""<style>
-.lb{
-  background:rgba(10,10,35,.92);
-  border:1px solid rgba(0,207,255,.2);border-radius:28px;
-  padding:48px 44px 40px;backdrop-filter:blur(20px);
-  box-shadow:0 32px 80px rgba(0,0,0,.7);
-  max-width:440px;width:100%;margin:0 auto;text-align:center;
-}
-.gb{
-  display:flex;align-items:center;justify-content:center;gap:14px;
-  background:#fff;color:#3c4043;border:none;border-radius:14px;
-  padding:15px 36px;font-size:1.05rem;font-weight:600;
-  cursor:pointer;text-decoration:none;width:100%;
-  transition:box-shadow .25s,transform .2s;
-  box-shadow:0 4px 20px rgba(0,0,0,.5);
-}
-.gb:hover{transform:translateY(-3px);box-shadow:0 10px 40px rgba(0,207,255,.3);color:#3c4043;}
-.pill{
-  display:inline-block;background:rgba(0,207,255,.08);
-  border:1px solid rgba(0,207,255,.2);border-radius:20px;
-  padding:5px 14px;font-size:.78rem;color:#8892b0;margin:3px;
-}
-</style>""", unsafe_allow_html=True)
-
-    # E'lonlar
-    anns = [a for a in load_ann() if a.get("public")]
-    for a in anns[-2:]:
-        st.markdown(
-            f"<div class='ann'>📢 <b>{a['title']}</b> — {a['text']}</div>",
-            unsafe_allow_html=True
-        )
-
-    _, mid, _ = st.columns([1, 2.2, 1])
-    with mid:
-        # Logo
-        st.markdown(
-            f"<div class='f1' style='text-align:center;margin-bottom:20px;'>"
-            f"<div class='fl'>{logo_img(200)}</div></div>",
-            unsafe_allow_html=True
-        )
-
-        # Kirish / Ro'yxat tablar
-        tab1, tab2 = st.tabs(["🔑 Kirish", "📝 Ro'yxatdan o'tish"])
-
-        with tab1:
-            st.markdown("<div class='f2'>", unsafe_allow_html=True)
-            with st.form("login_form", clear_on_submit=False):
-                email    = st.text_input("📧 Email", placeholder="email@gmail.com")
-                password = st.text_input("🔑 Parol", type="password", placeholder="Parolingiz")
-                submitted = st.form_submit_button("Kirish →", use_container_width=True)
-            if submitted:
-                uid = _uid_from_email(email.strip().lower())
-                u   = load_user(uid)
-                pwd_hash = hashlib.md5(password.encode()).hexdigest()
-                if u.get("email") and u.get("password") == pwd_hash:
-                    u = upd_streak(u)
-                    u = chk_bdg(u)
-                    st.session_state["user"] = u
-                    st.session_state["hist"] = load_hist(uid)
-                    st.session_state["page"] = "chat"
-                    st.rerun()
-                else:
-                    st.error("❌ Email yoki parol noto'g'ri!")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        with tab2:
-            st.markdown("<div class='f2'>", unsafe_allow_html=True)
-            with st.form("register_form", clear_on_submit=True):
-                r_name     = st.text_input("👤 Ism", placeholder="To'liq ismingiz")
-                r_email    = st.text_input("📧 Email", placeholder="email@gmail.com")
-                r_password = st.text_input("🔑 Parol", type="password", placeholder="Kamida 6 belgi")
-                r_sub      = st.form_submit_button("Ro'yxatdan o'tish →", use_container_width=True)
-            if r_sub:
-                r_email = r_email.strip().lower()
-                if len(r_password) < 6:
-                    st.warning("⚠️ Parol kamida 6 belgi bo'lishi kerak!")
-                elif not r_name.strip():
-                    st.warning("⚠️ Ism kiriting!")
-                else:
-                    uid = _uid_from_email(r_email)
-                    existing = load_user(uid)
-                    if existing.get("email"):
-                        st.error("❌ Bu email allaqachon ro'yxatdan o'tgan!")
-                    else:
-                        new_u = load_user(uid)
-                        new_u.update({
-                            "id":       uid,
-                            "name":     r_name.strip(),
-                            "email":    r_email,
-                            "password": hashlib.md5(r_password.encode()).hexdigest(),
-                            "avatar":   f"https://ui-avatars.com/api/?name={r_name}&background=5a7fff&color=fff",
-                        })
-                        save_user(new_u)
-                        # Sheets ga ham saqlash (ixtiyoriy)
-                        sheet_save_user(r_email, r_name.strip(),
-                                        hashlib.md5(r_password.encode()).hexdigest())
-                        st.success("✅ Muvaffaqiyatli! Endi 'Kirish' tabiga o'ting.")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        # Google bilan kirish
-        gu = g_url()
-        if gu:
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown(f"""<div class='f3' style='text-align:center;'>
-            <p style='color:#8892b0;font-size:.85rem;margin-bottom:8px;'>— yoki —</p>
-            <a href='{gu}' target='_self' class='gb'>
-              <svg width='22' height='22' viewBox='0 0 48 48'>
-                <path fill='#FFC107' d='M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8
-                  c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039
-                  l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24
-                  c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z'/>
-                <path fill='#FF3D00' d='M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12
-                  c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4
-                  C16.318,4,9.656,8.337,6.306,14.691z'/>
-                <path fill='#4CAF50' d='M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238
-                  C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946
-                  l-6.522,5.025C9.505,39.556,16.227,44,24,44z'/>
-                <path fill='#1976D2' d='M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571
-                  l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z'/>
-              </svg>
-              Google bilan kirish
-            </a>
-            <p style='text-align:center;font-size:.75rem;color:#556;margin:8px 0 0;'>
-              🔒 Xavfsiz OAuth2 autentifikatsiya
-            </p>
-            </div>""", unsafe_allow_html=True)
-        else:
-            st.markdown("""<div style='background:rgba(255,150,0,0.12);
-                border:1px solid rgba(255,150,0,0.3);border-radius:12px;
-                padding:16px;text-align:center;margin-top:16px;'>
-                <p style='color:#ffaa44;font-size:.9rem;margin:0;'>
-                  ⚙️ Google kirish sozlanmagan.<br>
-                  <code>.env</code> faylida
-                  <b>GOOGLE_CLIENT_ID</b> va <b>GOOGLE_CLIENT_SECRET</b> kiriting.
-                </p></div>""", unsafe_allow_html=True)
-
-        # Demo kirish
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("👀 Demo sifatida kirish", use_container_width=True, key="demo_btn"):
-            u = demo_login("Demo O'quvchi")
-            u = upd_streak(u)
-            st.session_state["user"] = u
-            st.session_state["hist"] = load_hist(u["id"])
-            st.session_state["page"] = "chat"
-            st.rerun()
-
-        # Imkoniyatlar
-        st.markdown("""<div style='text-align:center;margin-top:20px;'>
-            <span class='pill'>🤖 AI O'qituvchi</span>
-            <span class='pill'>📊 Analitika</span>
-            <span class='pill'>🏆 Turnirlar</span>
-            <span class='pill'>🃏 Flashcard</span>
-            <span class='pill'>💎 Premium</span>
-        </div>""", unsafe_allow_html=True)
-
-
-# ── SIDEBAR ───────────────────────────────────────────────────────────────────
-def render_sidebar(u: dict):
-    with st.sidebar:
-        st.markdown(
-            f"<div style='text-align:center;padding:8px 0 2px;'>{logo_img(140)}</div>",
-            unsafe_allow_html=True
-        )
-        st.markdown("---")
-
-        if u.get("avatar"):
-            st.markdown(
-                f"<div style='text-align:center;'>"
-                f"<img src='{u['avatar']}' style='border-radius:50%;width:56px;"
-                f"height:56px;border:2px solid #00cfff;'/></div>",
-                unsafe_allow_html=True
-            )
-
-        plan = get_plan(u)
-        pi   = PLANS.get(plan, {})
-        st.markdown(
-            f"<div style='text-align:center;margin:6px 0;'>"
-            f"<div style='font-weight:700;font-size:1rem;'>{u.get('name','')}</div>"
-            f"<span class='bdg p{plan}'>{pi.get('emoji','')} {pi.get('nom','')}</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-
-        lv, ln, cur, nxt = get_lv(u.get("xp", 0))
-        xp  = u.get("xp", 0)
-        pct = min((xp - cur) / max(nxt - cur, 1) * 100, 100)
-        st.markdown(
-            f"<div style='font-size:.8rem;color:#8892b0;margin-bottom:4px;'>"
-            f"Lv.{lv} {ln} — {xp} XP</div>"
-            f"<div class='xo'><div class='xi' style='width:{pct:.0f}%;'></div></div>"
-            f"<div style='text-align:center;font-size:.8rem;color:#8892b0;margin:4px 0 8px;'>"
-            f"🔥 {u.get('streak',0)} kun streak</div>",
-            unsafe_allow_html=True
-        )
-        st.markdown("---")
-
-        pages = [
-            ("💬", "Suhbat",         "chat"),
-            ("📊", "Analitika",      "analytics"),
-            ("📝", "Test Markazi",   "tests"),
-            ("🃏", "Flashcard",      "flashcard"),
-            ("🏆", "Turnir & Reyting","tournament"),
-            ("📚", "Kutubxona",      "library"),
-            ("📖", "Kitoblar",       "books"),
-            ("💎", "Premium",        "premium"),
-            ("⚙️", "Sozlamalar",     "settings"),
-        ]
-        if is_admin(u):
-            pages.append(("🛡️", "Admin Panel", "admin"))
-
-        if "page" not in st.session_state:
-            st.session_state["page"] = "chat"
-
-        for em, lb, key in pages:
-            active = st.session_state["page"] == key
-            if st.button(
-                f"{em} {lb}",
-                use_container_width=True,
-                type="primary" if active else "secondary",
-                key=f"nav_{key}"
-            ):
-                st.session_state["page"] = key
-                st.rerun()
-
-        st.markdown("---")
-
-        if not is_prem(u):
-            used = u.get("daily_q", 0)
-            st.markdown(
-                f"<div style='font-size:.8rem;color:#8892b0;margin-bottom:4px;'>"
-                f"Kunlik: {used}/{FREE_Q_LIMIT}</div>"
-                f"<div class='xo'><div class='xi' style='width:{min(used/FREE_Q_LIMIT*100,100):.0f}%;"
-                f"background:linear-gradient(90deg,#f59e0b,#ef4444);'></div></div>",
-                unsafe_allow_html=True
-            )
-            if st.button("💎 Premium olish", use_container_width=True):
-                st.session_state["page"] = "premium"
-                st.rerun()
-
-        if st.button("🚪 Chiqish", use_container_width=True):
-            for k in ["user", "hist", "page", "ts", "fc_i", "fc_s", "trn_s"]:
-                st.session_state.pop(k, None)
-            st.rerun()
-
-
-# ── CHAT ──────────────────────────────────────────────────────────────────────
-def render_chat(u: dict):
-    st.markdown("## 💬 AI O'qituvchi")
-
-    anns = load_ann()
-    for a in anns[-1:]:
-        st.markdown(
-            f"<div class='ann'>📢 <b>{a['title']}</b> — {a['text']}</div>",
-            unsafe_allow_html=True
-        )
-
-    hist = st.session_state.get("hist", [])
-    MODES  = ["💬 Oddiy suhbat", "👨‍💻 Kod rejimi", "📖 Kitob tahlili"]
-    MODE_K = ["chat",             "kod",             "kitob"]
-    STYLES = ["o'qituvchi", "do'st", "mentor", "akademik"]
-
-    c1, c2, c3 = st.columns(3)
+    # Til
+    c1,c2,c3 = st.columns(3)
     with c1:
-        if "cm" not in st.session_state:
-            st.session_state["cm"] = 0
-        sel = st.selectbox("Rejim", MODES,
-                           index=st.session_state["cm"],
-                           label_visibility="collapsed")
+        if st.button("🇺🇿 O'zbek", use_container_width=True, type="primary" if lang=="uz" else "secondary"):
+            st.session_state["lang"]="uz"; st.rerun()
+    with c2:
+        if st.button("🇬🇧 English", use_container_width=True, type="primary" if lang=="en" else "secondary"):
+            st.session_state["lang"]="en"; st.rerun()
+    with c3:
+        if st.button("🇷🇺 Русский", use_container_width=True, type="primary" if lang=="ru" else "secondary"):
+            st.session_state["lang"]="ru"; st.rerun()
+
+    # Logo
+    st.markdown(f'<div class="fl" style="margin:20px 0 16px;">{get_logo_b64(160)}</div>', unsafe_allow_html=True)
+
+    # Title
+    st.markdown(f'<h2 style="text-align:center;color:#fff;margin-bottom:18px;font-size:1.3rem;">{t("welcome_title")}</h2>',
+                unsafe_allow_html=True)
+
+    # Announcements
+    for a in [x for x in load_ann() if x.get("public")][-1:]:
+        st.markdown(f'<div class="ann">📢 <b>{a["title"]}</b> - {a["text"]}</div>', unsafe_allow_html=True)
+
+    tab1, tab2 = st.tabs([t("login"), t("register")])
+
+    with tab1:
+        with st.form("lf"):
+            email = st.text_input(t("email"), placeholder="email@gmail.com")
+            pwd   = st.text_input(t("password"), type="password")
+            sub   = st.form_submit_button(t("login_btn"), use_container_width=True)
+        if sub:
+            email = email.strip().lower()
+            uid   = uid_of(email)
+            u     = load_user(uid)
+            if u.get("email") and u.get("password") == hashlib.md5(pwd.encode()).hexdigest():
+                u = upd_streak(u); u["lang"] = lang; save_user(u)
+                if not u.get("chats"): new_chat(u)
+                token = mk_token(uid)
+                cid   = u.get("active_chat")
+                st.session_state.update({
+                    "user":u, "page":"chat",
+                    "hist":load_hist(uid,cid),
+                    "tok":token, "lang":lang,
+                })
+                st.rerun()
+            else:
+                st.error(t("wrong_pass"))
+
+    with tab2:
+        with st.form("rf"):
+            rname  = st.text_input(t("name"))
+            remail = st.text_input(t("email"), placeholder="email@gmail.com", key="re")
+            rpwd   = st.text_input(t("password"), type="password", key="rp")
+            rsub   = st.form_submit_button(t("reg_btn"), use_container_width=True)
+        if rsub:
+            if not rname.strip(): st.warning(t("name_empty"))
+            elif len(rpwd)<6: st.warning(t("pass_short"))
+            else:
+                remail = remail.strip().lower()
+                uid    = uid_of(remail)
+                exist  = load_user(uid)
+                if exist.get("email"): st.error(t("email_exists"))
+                else:
+                    nu = load_user(uid)
+                    nu.update({"id":uid,"name":rname.strip(),"email":remail,
+                               "password":hashlib.md5(rpwd.encode()).hexdigest(),
+                               "lang":lang})
+                    save_user(nu); st.success(t("reg_ok"))
+
+    st.markdown('</div></div>', unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── CHAT PAGE ─────────────────────────────────────────────────────────────────
+def page_chat(u):
+    hist   = st.session_state.get("hist",[])
+    cid    = u.get("active_chat")
+    lang   = st.session_state.get("lang","uz")
+    MODES  = [t("mode_chat"), t("mode_code"), t("mode_book")]
+    MODE_K = ["chat","kod","kitob"]
+
+    # Mode / Style selector bar
+    STYLES = {
+        "uz":["o'qituvchi","do'st","mentor","akademik","qiziqarli"],
+        "en":["teacher","friend","mentor","academic","fun"],
+        "ru":["учитель","друг","ментор","академик","весёлый"],
+    }.get(lang, ["o'qituvchi","do'st","mentor","akademik","qiziqarli"])
+
+    c1,c2,c3 = st.columns([3,2,1])
+    with c1:
+        if "cm" not in st.session_state: st.session_state["cm"]=0
+        sel = st.selectbox("",MODES,index=st.session_state["cm"],label_visibility="collapsed",key="msel")
         st.session_state["cm"] = MODES.index(sel)
     with c2:
-        cur_style = u.get("settings", {}).get("ai_style", "o'qituvchi")
-        idx = STYLES.index(cur_style) if cur_style in STYLES else 0
-        sty = st.selectbox("Uslub", STYLES, index=idx, label_visibility="collapsed")
-        u.setdefault("settings", {})["ai_style"] = sty
+        cs = u.get("settings",{}).get("ai_style","o'qituvchi")
+        idx = STYLES.index(cs) if cs in STYLES else 0
+        sty = st.selectbox("",STYLES,index=idx,label_visibility="collapsed",key="ssel")
+        u.setdefault("settings",{})["ai_style"] = sty
     with c3:
-        if st.button("🗑️ Tozalash", use_container_width=True):
-            save_hist(u["id"], [])
-            st.session_state["hist"] = []
-            st.rerun()
+        if st.button(t("clear"),use_container_width=True,key="clr"):
+            save_hist(u["id"],[],cid); st.session_state["hist"]=[]; st.rerun()
 
+    # Messages
     if not hist:
-        st.markdown(
-            "<div class='gc' style='text-align:center;'>"
-            "<div style='font-size:3rem;'>👋</div>"
-            "<h3>Assalomu alaykum! Men EduAI UZman.</h3>"
-            "<p style='color:#8892b0;'>Savollaringizni bering — tushuntiraman!</p>"
-            "</div>",
-            unsafe_allow_html=True
-        )
+        st.markdown(f"""<div class="welcome-box">
+          <div class="fl" style="font-size:2.8rem;">🎓</div>
+          <h2>{t('welcome')}</h2>
+          <p>{t('welcome_sub')}</p>
+        </div>""", unsafe_allow_html=True)
     else:
+        st.markdown('<div class="chat-wrap">', unsafe_allow_html=True)
         for m in hist:
-            role = m.get("role", "user")
-            cont = m.get("content", "")
-            ts   = m.get("ts", "")[:16].replace("T", " ")
-            if role == "user":
-                st.markdown(
-                    f"<div class='cu'>{cont}"
-                    f"<div style='font-size:.7rem;color:rgba(255,255,255,.4);"
-                    f"margin-top:4px;text-align:right;'>{ts}</div></div>",
-                    unsafe_allow_html=True
-                )
+            role = m.get("role","user")
+            txt  = m.get("content","").replace("<","&lt;").replace(">","&gt;").replace("\n","<br>")
+            ts   = m.get("ts","")[:16].replace("T"," ")
+            if role=="user":
+                st.markdown(f'<div class="msg-u"><div><div class="bbl">{txt}</div><div class="msg-ts" style="text-align:right;">{ts}</div></div></div>', unsafe_allow_html=True)
             else:
-                st.markdown(
-                    f"<div class='ca'>"
-                    f"<div style='font-size:.8rem;color:#00cfff;margin-bottom:6px;'>🤖 EduAI</div>"
-                    f"{cont}"
-                    f"<div style='font-size:.7rem;color:rgba(255,255,255,.3);margin-top:4px;'>{ts}</div>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
+                st.markdown(f'<div class="msg-a"><div class="ai-ic">AI</div><div><div class="bbl">{txt}</div><div class="msg-ts">EduAI · {ts}</div></div></div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    # Tezkor tugmalar
-    quick = ["📐 Matematika", "🔬 Fizika", "💻 Python",
-             "🌍 Ingliz tili", "🧬 Biologiya", "📝 Konspekt yarat"]
-    cols = st.columns(len(quick))
-    for i, q in enumerate(quick):
-        with cols[i]:
-            if st.button(q, key=f"qk{i}", use_container_width=True):
-                if "Konspekt" in q:
-                    with st.spinner("Konspekt yaratilmoqda..."):
-                        k = gen_konspekt(u, hist)
-                    st.markdown(f"<div class='gc'>{k}</div>", unsafe_allow_html=True)
-                    st.download_button(
-                        "⬇️ Yuklab olish", k.encode(),
-                        f"konspekt_{datetime.date.today()}.md", "text/markdown"
-                    )
-                    u = add_xp(u, 15)
-                    st.session_state["user"] = u
-                else:
-                    st.session_state["pend"] = q.split(" ", 1)[1]
-
+    # Limit check
     if not can_ask(u):
-        st.warning(f"⚠️ Kunlik {FREE_Q_LIMIT} ta savol limitiga yetdingiz!")
-        if st.button("💎 Premium — cheksiz savol!"):
-            st.session_state["page"] = "premium"
-            st.rerun()
+        st.warning(t("daily_limit",n=FREE_Q))
+        if st.button(t("get_premium"),key="prem_btn"):
+            st.session_state["page"]="premium"; st.rerun()
         return
 
-    inp = st.chat_input("Savolingizni yozing...")
+    # Input
+    inp = st.chat_input(t("ask_me"), key="ci")
     if "pend" in st.session_state:
         inp = st.session_state.pop("pend")
 
     if inp and inp.strip():
-        mode = MODE_K[st.session_state.get("cm", 0)]
-
-        # Har 5 xabarda kayfiyat tahlil
-        if u.get("total_messages", 0) % 5 == 0:
-            mood = mood_ai(u, inp)
-            u.setdefault("mood_history", []).append({
-                "ts":     datetime.datetime.now().isoformat(),
-                "mood":   mood.get("kayfiyat", "neytral"),
-                "daraja": mood.get("daraja", 5),
-            })
-
-        hist = add_msg(u["id"], "user", inp)
-        st.session_state["hist"] = hist
-
-        with st.spinner("🤔 AI o'ylamoqda..."):
-            reply = ask_ai(u, hist, mode)
-
-        hist = add_msg(u["id"], "assistant", reply)
-        st.session_state["hist"] = hist
-
-        u["total_messages"] = u.get("total_messages", 0) + 1
-        inc_daily(u)
-        u = add_xp(u, 5)
-        u = chk_bdg(u)
-        st.session_state["user"] = u
-        st.rerun()
-
+        mode = MODE_K[st.session_state.get("cm",0)]
+        if not hist: set_chat_title(u, cid, inp)
+        if u.get("total_messages",0) % 5 == 0:
+            md = mood_of(u, inp)
+            u.setdefault("mood_history",[]).append({
+                "ts":datetime.datetime.now().isoformat(),
+                "mood":md.get("kayfiyat","neytral"),"daraja":md.get("daraja",5)})
+        hist = push_msg(u["id"],"user",inp,cid); st.session_state["hist"]=hist
+        with st.spinner(t("thinking")): reply = call_ai(u,hist,mode)
+        hist = push_msg(u["id"],"assistant",reply,cid); st.session_state["hist"]=hist
+        u["total_messages"]=u.get("total_messages",0)+1; inc_q(u)
+        u=add_xp(u,5); u=chk_bdg(u); st.session_state["user"]=u
+        for c in u.get("chats",[]):
+            if c["id"]==cid: c["updated"]=datetime.datetime.now().isoformat(); break
+        save_user(u); st.rerun()
 
 # ── ANALYTICS ─────────────────────────────────────────────────────────────────
-def render_analytics(u: dict):
-    st.markdown("## 📊 O'qish Analitikasi")
-
-    hist  = load_hist(u["id"])
-    tests = u.get("test_scores", [])
-    moods = u.get("mood_history", [])
+def page_analytics(u):
+    st.markdown("## 📊 Analitika")
+    lang  = st.session_state.get("lang","uz")
+    cid   = u.get("active_chat")
+    hist  = load_hist(u["id"],cid)
+    tests = u.get("test_scores",[])
+    moods = u.get("mood_history",[])
     aus   = all_users()
-    avg   = round(np.mean([s["ball"] for s in tests]), 1) if tests else 0
-    rnk   = sorted(aus, key=lambda x: x.get("xp", 0), reverse=True)
-    mr    = next((i + 1 for i, x in enumerate(rnk) if x["id"] == u["id"]), "-")
+    avg   = round(np.mean([s["ball"] for s in tests]),1) if tests else 0
+    rnk   = sorted(aus,key=lambda x:x.get("xp",0),reverse=True)
+    mr    = next((i+1 for i,x in enumerate(rnk) if x["id"]==u["id"]),"-")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    for col, n, l in [
-        (c1, u.get("xp", 0),    "XP"),
-        (c2, len(hist),          "Xabarlar"),
-        (c3, len(tests),         "Testlar"),
-        (c4, f"{avg}%",          "O'rtacha"),
-        (c5, f"#{mr}",           "Reyting"),
-    ]:
+    cols=st.columns(5)
+    for col,n,lb in [(cols[0],u.get("xp",0),"XP"),(cols[1],len(hist),"Xabarlar"),
+                     (cols[2],len(tests),"Testlar"),(cols[3],f"{avg}%","O'rtacha"),(cols[4],f"#{mr}","Reyting")]:
         with col:
-            st.markdown(
-                f"<div class='sc'>"
-                f"<div class='sn'>{n}</div>"
-                f"<div style='color:#8892b0;font-size:.85rem;'>{l}</div>"
-                f"</div>",
-                unsafe_allow_html=True
-            )
+            st.markdown(f"<div class='sc'><div class='sn'>{n}</div><div style='color:var(--muted);font-size:.8rem;'>{lb}</div></div>",unsafe_allow_html=True)
 
     st.markdown("---")
-    cl, cr = st.columns(2)
-
+    cl,cr=st.columns(2)
     with cl:
         st.markdown("### 🕸️ Bilim Xaritasi")
-        tp   = u.get("topics", {})
-        cats = (list(tp.keys())[:8] if tp
-                else ["Matematika","Fizika","Kimyo","Biologiya",
-                      "Informatika","Tarix","Ingliz","Adabiyot"])
-        vals = ([tp[k] for k in cats] if tp
-                else [random.randint(10, 90) for _ in cats])
-        fig = go.Figure(go.Scatterpolar(
-            r=vals + [vals[0]], theta=cats + [cats[0]],
-            fill="toself",
-            fillcolor="rgba(0,207,255,.12)",
-            line=dict(color="#00cfff", width=2)
-        ))
-        fig.update_layout(
-            polar=dict(
-                radialaxis=dict(range=[0,100], gridcolor="rgba(255,255,255,.1)"),
-                angularaxis=dict(gridcolor="rgba(255,255,255,.1)",
-                                 tickfont=dict(color="#e8eaf6"))
-            ),
-            paper_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#e8eaf6"),
-            height=380, showlegend=False,
-            margin=dict(l=40, r=40, t=40, b=40)
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
+        tp=u.get("topics",{}); cats=list(tp.keys())[:8] if tp else ["Matematika","Fizika","Kimyo","Biologiya","Informatika","Tarix","Ingliz","Adabiyot"]
+        vals=[tp[k] for k in cats] if tp else [__import__('random').randint(10,90) for _ in cats]
+        fig=go.Figure(go.Scatterpolar(r=vals+[vals[0]],theta=cats+[cats[0]],fill="toself",
+            fillcolor="rgba(0,212,255,.09)",line=dict(color="#00d4ff",width=2)))
+        fig.update_layout(polar=dict(radialaxis=dict(range=[0,100],gridcolor="rgba(255,255,255,.07)"),
+            angularaxis=dict(gridcolor="rgba(255,255,255,.07)",tickfont=dict(color="#e8eaf6"))),
+            paper_bgcolor="rgba(0,0,0,0)",font=dict(color="#e8eaf6"),height=340,showlegend=False,margin=dict(l=40,r=40,t=20,b=20))
+        st.plotly_chart(fig,use_container_width=True)
     with cr:
         st.markdown("### 📈 Test Natijalari")
         if tests:
-            df = pd.DataFrame(tests[-20:])
-            fig2 = go.Figure(go.Scatter(
-                x=list(range(len(df))), y=df["ball"],
-                mode="lines+markers",
-                line=dict(color="#00cfff", width=2),
-                marker=dict(size=8, color=df["ball"],
-                            colorscale="RdYlGn", cmin=0, cmax=100)
-            ))
-            fig2.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#e8eaf6"), height=380,
-                xaxis=dict(gridcolor="rgba(255,255,255,.05)"),
-                yaxis=dict(gridcolor="rgba(255,255,255,.05)", range=[0,100]),
-                margin=dict(l=20, r=20, t=20, b=20)
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("Hali test natijalari yo'q.")
+            df=pd.DataFrame(tests[-20:])
+            fig2=go.Figure(go.Scatter(x=list(range(len(df))),y=df["ball"],mode="lines+markers",
+                line=dict(color="#00d4ff",width=2),marker=dict(size=8,color=df["ball"],colorscale="RdYlGn",cmin=0,cmax=100)))
+            fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e8eaf6"),height=340,
+                xaxis=dict(gridcolor="rgba(255,255,255,.04)"),yaxis=dict(gridcolor="rgba(255,255,255,.04)",range=[0,100]),
+                margin=dict(l=16,r=16,t=16,b=16))
+            st.plotly_chart(fig2,use_container_width=True)
+        else: st.info("Hali test natijalari yo'q.")
 
     if moods:
-        st.markdown("### 🌡️ Kayfiyat Heatmap")
-        mm    = {"xursand": 4, "neytral": 3, "stressli": 2, "xafa": 1}
-        days  = [m.get("ts", "")[:10] for m in moods[-30:]]
-        scores = [mm.get(m.get("mood", "neytral"), 3) for m in moods[-30:]]
-        fig3 = go.Figure(go.Heatmap(
-            z=[scores], x=days, y=["Kayfiyat"],
-            colorscale=[[0,"#ff4444"],[.33,"#ff9f00"],[.66,"#00cfff"],[1,"#00ff9f"]],
-            zmin=1, zmax=4,
-            colorbar=dict(
-                tickvals=[1,2,3,4],
-                ticktext=["Xafa","Stressli","Neytral","Xursand"],
-                tickfont=dict(color="#e8eaf6")
-            )
-        ))
-        fig3.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#e8eaf6"), height=160,
-            margin=dict(l=20, r=20, t=20, b=40)
-        )
-        st.plotly_chart(fig3, use_container_width=True)
+        st.markdown("### 🌡️ Kayfiyat Tarixi")
+        mm={"xursand":4,"neytral":3,"stressli":2,"xafa":1}
+        days=[m.get("ts","")[:10] for m in moods[-30:]]; scores=[mm.get(m.get("mood","neytral"),3) for m in moods[-30:]]
+        fig3=go.Figure(go.Heatmap(z=[scores],x=days,y=["Kayfiyat"],
+            colorscale=[[0,"#ff4444"],[.33,"#ff9900"],[.66,"#00d4ff"],[1,"#00ff9f"]],
+            zmin=1,zmax=4,colorbar=dict(tickvals=[1,2,3,4],ticktext=["Xafa","Stressli","Neytral","Xursand"],
+                tickfont=dict(color="#e8eaf6"))))
+        fig3.update_layout(paper_bgcolor="rgba(0,0,0,0)",font=dict(color="#e8eaf6"),height=140,margin=dict(l=16,r=16,t=8,b=28))
+        st.plotly_chart(fig3,use_container_width=True)
 
     st.markdown("### 🏅 Badge'lar")
-    bdgs = u.get("badges", [])
+    bdgs=u.get("badges",[])
     if bdgs:
-        cols = st.columns(min(len(bdgs), 5))
-        for i, bid in enumerate(bdgs):
-            b = BDGS.get(bid, {})
-            with cols[i % 5]:
-                st.markdown(
-                    f"<div class='gc' style='text-align:center;padding:12px;'>"
-                    f"<div style='font-size:2rem;'>{b.get('e','🏅')}</div>"
-                    f"<div style='font-size:.8rem;font-weight:700;'>{b.get('n','')}</div>"
-                    f"<div style='font-size:.7rem;color:#8892b0;'>{b.get('t','')}</div>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-    else:
-        st.info("Badge yo'q. Ko'proq o'rgan!")
-
+        cols=st.columns(min(len(bdgs),5))
+        for i,bid in enumerate(bdgs):
+            b=BDGS.get(bid,{})
+            with cols[i%5]:
+                st.markdown(f"<div class='gc' style='text-align:center;padding:10px;'><div style='font-size:1.7rem;'>{b.get('e','🏅')}</div><div style='font-size:.78rem;font-weight:700;'>{b.get('n','')}</div><div style='font-size:.65rem;color:var(--muted);'>{b.get('t','')}</div></div>",unsafe_allow_html=True)
+    else: st.info("Hali badge yo'q.")
 
 # ── TESTS ─────────────────────────────────────────────────────────────────────
-def render_tests(u: dict):
+def page_tests(u):
     st.markdown("## 📝 Test Markazi")
-
     if not is_prem(u):
-        today_m = datetime.date.today().strftime("%Y-%m")
-        if u.get("monthly_date", "") != today_m:
-            u["monthly_t"] = 0
-            u["monthly_date"] = today_m
-            save_user(u)
-        used = u.get("monthly_t", 0)
-        st.markdown(
-            f"<div style='font-size:.85rem;color:#8892b0;margin-bottom:8px;'>"
-            f"Oylik test: {used}/{FREE_T_LIMIT}</div>",
-            unsafe_allow_html=True
-        )
-        if used >= FREE_T_LIMIT:
-            st.warning("⚠️ Oylik limit!")
-            if st.button("💎 Premium — cheksiz test"):
-                st.session_state["page"] = "premium"
-                st.rerun()
+        today_m=datetime.date.today().strftime("%Y-%m")
+        if u.get("monthly_date","")!=today_m: u["monthly_t"]=0; u["monthly_date"]=today_m; save_user(u)
+        used=u.get("monthly_t",0)
+        st.markdown(f"<div style='font-size:.8rem;color:var(--muted);margin-bottom:6px;'>Oylik: {used}/{FREE_T}</div>",unsafe_allow_html=True)
+        if used>=FREE_T:
+            st.warning("⚠️ Oylik limit!"); 
+            if st.button(t("get_premium")): st.session_state["page"]="premium"; st.rerun()
             return
 
-    ts = st.session_state.get("ts")
-
+    ts=st.session_state.get("ts")
     if ts is None:
-        st.markdown("<div class='gc'>", unsafe_allow_html=True)
-        mavzu  = st.text_input("Mavzu", "", placeholder="Kvadrat tenglamalar, Python, Tarix...")
-        c1, c2, c3 = st.columns(3)
-        with c1: soni   = st.slider("Savollar", 3, 20, 5)
-        with c2: daraja = st.selectbox("Qiyinlik", ["Boshlang'ich", "O'rta", "Yuqori"])
-        with c3: lang   = st.selectbox("Til", ["O'zbek", "Rus", "Ingliz"])
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        if st.button("🚀 Test Boshlash", use_container_width=True):
+        with st.container():
+            st.markdown("<div class='gc'>",unsafe_allow_html=True)
+            mavzu=st.text_input("Mavzu","",placeholder="Kvadrat tenglamalar, Python, Tarix...")
+            c1,c2,c3=st.columns(3)
+            with c1: soni=st.slider("Savollar",3,20,5)
+            with c2: daraja=st.selectbox("Qiyinlik",["Boshlang'ich","O'rta","Yuqori"])
+            with c3: ltil=st.selectbox("Til",["O'zbek","Ingliz","Rus"])
+            st.markdown("</div>",unsafe_allow_html=True)
+        if st.button("🚀 Test Boshlash",use_container_width=True):
             if mavzu.strip():
                 with st.spinner("Test yaratilmoqda..."):
-                    qs = gen_test(u, f"{mavzu} ({daraja}, {lang} tilida)", soni)
+                    qs=gen_test(u,f"{mavzu} ({daraja}, {ltil} tilida)",soni)
                 if qs:
-                    st.session_state["ts"] = {"qs": qs, "cur": 0, "ans": [], "mavzu": mavzu}
-                    if not is_prem(u):
-                        u["monthly_t"] = u.get("monthly_t", 0) + 1
-                        save_user(u)
-                        st.session_state["user"] = u
+                    st.session_state["ts"]={"qs":qs,"cur":0,"ans":[],"mavzu":mavzu}
+                    if not is_prem(u): u["monthly_t"]=u.get("monthly_t",0)+1; save_user(u); st.session_state["user"]=u
                     st.rerun()
-                else:
-                    st.error("Test yaratishda xato. Mavzuni o'zgartiring.")
-            else:
-                st.warning("Mavzu kiriting!")
-
-        sc = u.get("test_scores", [])
+                else: st.error("Test yaratishda xato.")
+            else: st.warning("Mavzu kiriting!")
+        sc=u.get("test_scores",[])
         if sc:
             st.markdown("### 📊 O'tgan Testlar")
-            for s in reversed(sc[-10:]):
-                e = "✅" if s["ball"] >= 70 else "⚠️" if s["ball"] >= 50 else "❌"
-                st.markdown(
-                    f"<div class='gc' style='padding:10px;display:flex;"
-                    f"justify-content:space-between;'>"
-                    f"<span>{e} <b>{s.get('mavzu','')}</b></span>"
-                    f"<span style='color:#00cfff;'>{s['ball']}% — {s.get('sana','')[:10]}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
+            for s in reversed(sc[-8:]):
+                e="✅" if s["ball"]>=70 else "⚠️" if s["ball"]>=50 else "❌"
+                st.markdown(f"<div class='gc' style='padding:10px;display:flex;justify-content:space-between;'><span>{e} <b>{s.get('mavzu','')}</b></span><span style='color:var(--c1);'>{s['ball']}% · {s.get('sana','')[:10]}</span></div>",unsafe_allow_html=True)
     else:
-        qs  = ts["qs"]
-        cur = ts["cur"]
-        ans = ts["ans"]
-
-        if cur >= len(qs):
-            ok    = sum(1 for a in ans if a.get("ok"))
-            total = len(qs)
-            ball  = round(ok / total * 100)
-            e = "🏆" if ball >= 80 else "📚" if ball >= 50 else "📖"
-            st.markdown(
-                f"<div class='gc' style='text-align:center;'>"
-                f"<div style='font-size:4rem;'>{e}</div>"
-                f"<h2>Test yakunlandi!</h2>"
-                f"<div class='sn' style='font-size:3rem;'>{ball}%</div>"
-                f"<p>{ok}/{total} to'g'ri</p></div>",
-                unsafe_allow_html=True
-            )
-            xpe = ok * 25 + (50 if ball >= 80 else 0)
-            u = add_xp(u, xpe)
-            u.setdefault("test_scores", []).append({
-                "mavzu": ts["mavzu"], "ball": ball,
-                "togri": ok, "jami": total,
-                "sana": datetime.datetime.now().isoformat()
-            })
-            u = chk_bdg(u)
-            st.session_state["user"] = u
-            st.success(f"🎉 +{xpe} XP!")
-
-            for i, (q, a) in enumerate(zip(qs, ans)):
-                ok2 = a.get("ok", False)
-                st.markdown(
-                    f"<div class='gc' style='border-color:{'#00ff9f' if ok2 else '#ff4444'};'>"
-                    f"<b>{'✅' if ok2 else '❌'} {i+1}. {q.get('savol','')}</b><br>"
-                    f"<span style='color:#00cfff;'>Sizning: {a.get('javob','')}</span><br>"
-                    f"<span style='color:#00ff9f;'>To'g'ri: {q.get('togri_javob','')}</span><br>"
-                    f"<small style='color:#8892b0;'>{q.get('izoh','')}</small></div>",
-                    unsafe_allow_html=True
-                )
-
-            ca, cb = st.columns(2)
+        qs=ts["qs"]; cur=ts["cur"]; ans=ts["ans"]
+        if cur>=len(qs):
+            ok=sum(1 for a in ans if a.get("ok")); total=len(qs); ball=round(ok/total*100)
+            e="🏆" if ball>=80 else "📚" if ball>=50 else "📖"
+            st.markdown(f"<div class='gc' style='text-align:center;'><div style='font-size:3rem;'>{e}</div><h2>Test yakunlandi!</h2><div class='sn' style='font-size:2.6rem;'>{ball}%</div><p>{ok}/{total} to'g'ri</p></div>",unsafe_allow_html=True)
+            xpe=ok*25+(50 if ball>=80 else 0)
+            u=add_xp(u,xpe); u.setdefault("test_scores",[]).append({"mavzu":ts["mavzu"],"ball":ball,"togri":ok,"jami":total,"sana":datetime.datetime.now().isoformat()})
+            u=chk_bdg(u); st.session_state["user"]=u; st.success(f"🎉 +{xpe} XP!")
+            for i,(q,a) in enumerate(zip(qs,ans)):
+                ok2=a.get("ok",False)
+                st.markdown(f"<div class='gc' style='border-color:{'#00ff9f' if ok2 else '#ff4444'};padding:10px;'><b>{'✅' if ok2 else '❌'} {i+1}. {q.get('savol','')}</b><br><span style='color:var(--c1);'>Sizning: {a.get('javob','')}</span><br><span style='color:#00ff9f;'>To'g'ri: {q.get('togri_javob','')}</span><br><small style='color:var(--muted);'>{q.get('izoh','')}</small></div>",unsafe_allow_html=True)
+            ca,cb=st.columns(2)
             with ca:
-                if st.button("🔄 Yangi Test", use_container_width=True):
-                    st.session_state["ts"] = None
-                    st.rerun()
+                if st.button("🔄 Yangi Test",use_container_width=True): st.session_state["ts"]=None; st.rerun()
             with cb:
-                if st.button("📊 Analitika", use_container_width=True):
-                    st.session_state.update({"page": "analytics", "ts": None})
-                    st.rerun()
+                if st.button("📊 Analitika",use_container_width=True): st.session_state.update({"page":"analytics","ts":None}); st.rerun()
         else:
-            q = qs[cur]
-            st.markdown(
-                f"<div style='font-size:.85rem;color:#8892b0;margin-bottom:4px;'>"
-                f"Savol {cur+1}/{len(qs)}</div>"
-                f"<div class='xo'><div class='xi' style='width:{cur/len(qs)*100:.0f}%;'></div></div>",
-                unsafe_allow_html=True
-            )
-            st.markdown(
-                f"<div class='gc'><h3>❓ {q.get('savol','')}</h3></div>",
-                unsafe_allow_html=True
-            )
-            for v in q.get("variantlar", []):
-                if st.button(v, key=f"v{cur}_{v}", use_container_width=True):
-                    ok2 = v[0].upper() == q.get("togri_javob", "").upper()
-                    ans.append({"javob": v, "ok": ok2})
-                    ts["cur"] = cur + 1
-                    ts["ans"] = ans
-                    st.session_state["ts"] = ts
-                    if ok2:
-                        st.success("✅ To'g'ri!")
-                    else:
-                        st.error(f"❌ To'g'ri: {q.get('togri_javob','')}")
-                    time.sleep(0.4)
-                    st.rerun()
-
+            q=qs[cur]
+            st.markdown(f"<div style='font-size:.8rem;color:var(--muted);margin-bottom:3px;'>Savol {cur+1}/{len(qs)}</div><div class='xo'><div class='xi' style='width:{cur/len(qs)*100:.0f}%;'></div></div>",unsafe_allow_html=True)
+            st.markdown(f"<div class='gc'><h3>❓ {q.get('savol','')}</h3></div>",unsafe_allow_html=True)
+            for v in q.get("variantlar",[]):
+                if st.button(v,key=f"v{cur}_{v}",use_container_width=True):
+                    ok2=v[0].upper()==q.get("togri_javob","").upper()
+                    ans.append({"javob":v,"ok":ok2}); ts["cur"]=cur+1; ts["ans"]=ans; st.session_state["ts"]=ts
+                    if ok2: st.success("✅ To'g'ri!")
+                    else: st.error(f"❌ To'g'ri: {q.get('togri_javob','')}")
+                    time.sleep(0.3); st.rerun()
 
 # ── FLASHCARD ─────────────────────────────────────────────────────────────────
-def render_flashcard(u: dict):
-    st.markdown("## 🃏 Flashcard — Tez Yodlash")
-
+def page_flashcard(u):
+    st.markdown("## 🃏 Flashcard")
     if not is_prem(u):
-        st.warning("⭐ Flashcard faqat Premium foydalanuvchilarga!")
-        if st.button("💎 Premium olish"):
-            st.session_state["page"] = "premium"
-            st.rerun()
+        st.warning("⭐ Flashcard faqat Premium uchun!")
+        if st.button(t("get_premium")): st.session_state["page"]="premium"; st.rerun()
         return
-
-    t1, t2 = st.tabs(["📖 O'rganish", "➕ Yangi Yaratish"])
-
-    with t1:
-        cards = u.get("flashcards", [])
-        if not cards:
-            st.info("Hali karta yo'q. 'Yangi Yaratish' da yarating!")
+    tab1,tab2=st.tabs(["📖 O'rganish","➕ Yaratish"])
+    with tab1:
+        cards=u.get("flashcards",[])
+        if not cards: st.info("Hali karta yo'q.")
         else:
-            if "fc_i" not in st.session_state: st.session_state["fc_i"] = 0
-            if "fc_s" not in st.session_state: st.session_state["fc_s"] = False
-            idx  = st.session_state["fc_i"] % len(cards)
-            card = cards[idx]
-            st.markdown(
-                f"<div style='text-align:center;color:#8892b0;font-size:.85rem;margin-bottom:8px;'>"
-                f"{idx+1}/{len(cards)}</div>",
-                unsafe_allow_html=True
-            )
-            if not st.session_state["fc_s"]:
-                st.markdown(
-                    f"<div class='fc'><div>"
-                    f"<div style='font-size:.8rem;color:#8892b0;margin-bottom:8px;'>❓ SAVOL</div>"
-                    f"<div style='font-size:1.4rem;font-weight:700;'>{card.get('savol','')}</div>"
-                    f"</div></div>",
-                    unsafe_allow_html=True
-                )
-                if st.button("👁️ Javobni ko'rish", use_container_width=True):
-                    st.session_state["fc_s"] = True
-                    st.rerun()
+            if "fci" not in st.session_state: st.session_state["fci"]=0
+            if "fcs" not in st.session_state: st.session_state["fcs"]=False
+            idx=st.session_state["fci"]%len(cards); card=cards[idx]
+            st.markdown(f"<div style='text-align:center;color:var(--muted);font-size:.8rem;margin-bottom:6px;'>{idx+1}/{len(cards)}</div>",unsafe_allow_html=True)
+            if not st.session_state["fcs"]:
+                st.markdown(f"<div class='fc'><div><div style='font-size:.75rem;color:var(--muted);margin-bottom:8px;'>❓ SAVOL</div><div style='font-size:1.25rem;font-weight:700;'>{card.get('savol','')}</div></div></div>",unsafe_allow_html=True)
+                if st.button("👁️ Javobni ko'rish",use_container_width=True): st.session_state["fcs"]=True; st.rerun()
             else:
-                st.markdown(
-                    f"<div class='fc' style='border-color:#00ff9f;'><div>"
-                    f"<div style='font-size:.8rem;color:#00ff9f;margin-bottom:8px;'>✅ JAVOB</div>"
-                    f"<div style='font-size:1.2rem;'>{card.get('javob','')}</div>"
-                    f"</div></div>",
-                    unsafe_allow_html=True
-                )
-                ca, cb, cc = st.columns(3)
+                st.markdown(f"<div class='fc' style='border-color:#00ff9f;'><div><div style='font-size:.75rem;color:#00ff9f;margin-bottom:8px;'>✅ JAVOB</div><div style='font-size:1.1rem;'>{card.get('javob','')}</div></div></div>",unsafe_allow_html=True)
+                ca,cb,cc=st.columns(3)
                 with ca:
-                    if st.button("😓 Qiyin", use_container_width=True):
-                        st.session_state["fc_s"] = False
-                        st.rerun()
+                    if st.button("😓 Qiyin",use_container_width=True): st.session_state["fcs"]=False; st.rerun()
                 with cb:
-                    if st.button("🤔 O'rtacha", use_container_width=True):
-                        st.session_state.update({
-                            "fc_i": (idx + 1) % len(cards), "fc_s": False
-                        })
-                        st.rerun()
+                    if st.button("🤔 O'rtacha",use_container_width=True): st.session_state.update({"fci":(idx+1)%len(cards),"fcs":False}); st.rerun()
                 with cc:
-                    if st.button("✅ Bildim!", use_container_width=True):
-                        u = add_xp(u, 3)
-                        st.session_state.update({
-                            "user": u,
-                            "fc_i": (idx + 1) % len(cards),
-                            "fc_s": False,
-                        })
-                        st.rerun()
-
-    with t2:
-        st.markdown("<div class='gc'>", unsafe_allow_html=True)
-        mavzu = st.text_input("Mavzu", "", placeholder="Ingliz tili so'zlari, Python terminlari...")
-        soni  = st.slider("Nechta karta", 5, 30, 10)
-        if st.button("🤖 AI bilan Yaratish", use_container_width=True):
+                    if st.button("✅ Bildim!",use_container_width=True):
+                        u=add_xp(u,3); st.session_state.update({"user":u,"fci":(idx+1)%len(cards),"fcs":False}); st.rerun()
+    with tab2:
+        mavzu=st.text_input("Mavzu","",placeholder="Ingliz so'zlari, Python...")
+        soni=st.slider("Nechta",5,30,10)
+        if st.button("🤖 AI bilan Yaratish",use_container_width=True):
             if mavzu.strip():
-                with st.spinner("Yaratilmoqda..."):
-                    fcs = gen_flash(u, mavzu, soni)
+                with st.spinner("Yaratilmoqda..."): fcs=gen_flash(u,mavzu,soni)
                 if fcs:
-                    u.setdefault("flashcards", []).extend(fcs)
-                    save_user(u)
-                    u = add_xp(u, 20)
-                    st.session_state["user"] = u
-                    st.success(f"✅ {len(fcs)} ta karta! +20 XP")
-                    st.rerun()
-                else:
-                    st.error("Xato. Mavzuni o'zgartiring.")
-            else:
-                st.warning("Mavzu kiriting!")
-        st.markdown("</div>", unsafe_allow_html=True)
-
+                    u.setdefault("flashcards",[]).extend(fcs); save_user(u); u=add_xp(u,20); st.session_state["user"]=u
+                    st.success(f"✅ {len(fcs)} ta karta! +20 XP"); st.rerun()
+                else: st.error("Xato yuz berdi.")
+            else: st.warning("Mavzu kiriting!")
         if u.get("flashcards"):
             st.markdown(f"**Jami:** {len(u['flashcards'])} ta karta")
-            if st.button("🗑️ Barcha kartalarni o'chirish"):
-                u["flashcards"] = []
-                save_user(u)
-                st.session_state["user"] = u
-                st.rerun()
-
+            if st.button("🗑️ Hammasini o'chirish"):
+                u["flashcards"]=[]; save_user(u); st.session_state["user"]=u; st.rerun()
 
 # ── TOURNAMENT ────────────────────────────────────────────────────────────────
-def render_tournament(u: dict):
+def page_tournament(u):
     st.markdown("## 🏆 Turnir & Reyting")
-    t1, t2 = st.tabs(["🏅 Reyting", "⚔️ Haftalik Turnir"])
-
-    with t1:
-        aus = all_users()
-        rnk = sorted(aus, key=lambda x: x.get("xp", 0), reverse=True)
-        for i, x in enumerate(rnk[:20]):
-            is_me = x["id"] == u["id"]
-            re2   = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else f"{i+1}."
-            lv2, ln2, _, _ = get_lv(x.get("xp", 0))
-            bg  = "rgba(0,207,255,.08)" if is_me else "transparent"
-            bd  = "rgba(0,207,255,.4)"  if is_me else "rgba(255,255,255,.05)"
-            pe  = PLANS.get(x.get("premium", "free"), {}).get("emoji", "")
-            st.markdown(f"""<div style='background:{bg};border:1px solid {bd};border-radius:10px;
-                padding:10px 16px;margin:4px 0;display:flex;align-items:center;justify-content:space-between;'>
-                <div style='display:flex;align-items:center;gap:12px;'>
-                  <span style='font-size:1.2rem;width:36px;'>{re2}</span>
-                  <div>
-                    <div style='font-weight:{"700" if is_me else "400"};'>
-                      {x.get('name','?')} {pe} {"← Sen" if is_me else ""}
-                    </div>
-                    <div style='font-size:.75rem;color:#8892b0;'>Lv.{lv2} {ln2}</div>
-                  </div>
-                </div>
-                <div style='text-align:right;'>
-                  <div style='color:#00cfff;font-weight:700;'>{x.get('xp',0)} XP</div>
-                  <div style='font-size:.75rem;color:#8892b0;'>{len(x.get('test_scores',[]))} test</div>
-                </div></div>""", unsafe_allow_html=True)
-
-    with t2:
+    tab1,tab2=st.tabs(["🏅 Reyting","⚔️ Haftalik Turnir"])
+    with tab1:
+        lang=st.session_state.get("lang","uz")
+        aus=all_users(); rnk=sorted(aus,key=lambda x:x.get("xp",0),reverse=True)
+        for i,x in enumerate(rnk[:20]):
+            is_me=x["id"]==u["id"]
+            re2="🥇" if i==0 else "🥈" if i==1 else "🥉" if i==2 else f"{i+1}."
+            lv2,ln2,_,_=lv_info(x.get("xp",0),lang)
+            bg="rgba(0,212,255,.06)" if is_me else "transparent"
+            bd="rgba(0,212,255,.3)" if is_me else "rgba(255,255,255,.04)"
+            pe=PLANS.get(x.get("premium","free"),{}).get("emoji","")
+            st.markdown(f"<div style='background:{bg};border:1px solid {bd};border-radius:9px;padding:9px 14px;margin:3px 0;display:flex;align-items:center;justify-content:space-between;'><div style='display:flex;align-items:center;gap:10px;'><span style='font-size:1rem;width:30px;'>{re2}</span><div><div style='font-weight:{'700' if is_me else '400'};font-size:.88rem;'>{x.get('name','?')} {pe}{'  <- Sen' if is_me else ''}</div><div style='font-size:.7rem;color:var(--muted);'>Lv.{lv2} {ln2}</div></div></div><div style='text-align:right;'><div style='color:var(--c1);font-weight:700;font-size:.88rem;'>{x.get('xp',0)} XP</div><div style='font-size:.7rem;color:var(--muted);'>{len(x.get('test_scores',[]))} test</div></div></div>",unsafe_allow_html=True)
+    with tab2:
         if not is_prem(u):
             st.warning("⭐ Turnir uchun Premium kerak!")
-            if st.button("💎 Premium olish"):
-                st.session_state["page"] = "premium"
-                st.rerun()
+            if st.button(t("get_premium")): st.session_state["page"]="premium"; st.rerun()
             return
-
-        st.markdown("<div class='gc'>", unsafe_allow_html=True)
-        st.markdown("### ⚔️ Haftalik Matematika Turniri")
-        we = datetime.datetime.now() + datetime.timedelta(days=(6 - datetime.datetime.now().weekday()))
-        st.markdown(f"<p style='color:#8892b0;'>Tugash: {we.strftime('%d.%m.%Y')}</p>",
-                    unsafe_allow_html=True)
-        st.markdown("**Sovrin:** 🏆 500 XP + Turnir g'olibi badge!")
-
-        if "trn_s" not in st.session_state:
-            if st.button("⚔️ Turnirga Qatnashish!", use_container_width=True):
-                with st.spinner("Test yaratilmoqda..."):
-                    qs = gen_test(u, "Matematika yuqori daraja, juda qiyin", 10)
-                st.session_state.update({
-                    "trn_s": True, "trn_qs": qs, "trn_ans": [], "trn_cur": 0
-                })
-                st.rerun()
+        st.markdown("<div class='gc'>",unsafe_allow_html=True)
+        we=datetime.datetime.now()+datetime.timedelta(days=(6-datetime.datetime.now().weekday()))
+        st.markdown(f"**⚔️ Haftalik Turnir** | Tugash: {we.strftime('%d.%m.%Y')} | **Sovrin: 🏆 500 XP + Badge!**")
+        if "trns" not in st.session_state:
+            if st.button("⚔️ Qatnashish!",use_container_width=True):
+                with st.spinner("Test yaratilmoqda..."): qs=gen_test(u,"Matematika yuqori daraja",10)
+                st.session_state.update({"trns":True,"trnq":qs,"trna":[],"trnc":0}); st.rerun()
         else:
-            qs  = st.session_state.get("trn_qs", [])
-            cur = st.session_state.get("trn_cur", 0)
-            ans = st.session_state.get("trn_ans", [])
-            if cur >= len(qs):
-                ok   = sum(1 for a in ans if a)
-                ball = round(ok / max(len(qs), 1) * 100)
-                st.success(f"🏆 Turnir: {ball}% ({ok}/{len(qs)})")
-                if ball >= 70:
-                    u = add_xp(u, 500)
-                    if "turnir" not in u.get("badges", []):
-                        u.setdefault("badges", []).append("turnir")
-                    save_user(u)
-                    st.session_state["user"] = u
-                    st.balloons()
-                    st.success("🥇 +500 XP va Turnir g'olibi badge!")
+            qs=st.session_state.get("trnq",[]); cur=st.session_state.get("trnc",0); ans=st.session_state.get("trna",[])
+            if cur>=len(qs):
+                ok=sum(1 for a in ans if a); ball=round(ok/max(len(qs),1)*100); st.success(f"🏆 {ball}% ({ok}/{len(qs)})")
+                if ball>=70:
+                    u=add_xp(u,500)
+                    if "champ" not in u.get("badges",[]): u.setdefault("badges",[]).append("champ")
+                    save_user(u); st.session_state["user"]=u; st.balloons(); st.success("🥇 +500 XP!")
                 if st.button("🔄 Qayta"):
-                    for k in ["trn_s", "trn_qs", "trn_ans", "trn_cur"]:
-                        st.session_state.pop(k, None)
+                    for k in ["trns","trnq","trna","trnc"]: st.session_state.pop(k,None)
                     st.rerun()
             elif qs:
-                q = qs[cur]
-                st.markdown(f"**Savol {cur+1}/{len(qs)}:** {q.get('savol','')}")
-                for v in q.get("variantlar", []):
-                    if st.button(v, key=f"tv{cur}_{v}", use_container_width=True):
-                        ok2 = v[0].upper() == q.get("togri_javob", "").upper()
-                        ans.append(ok2)
-                        st.session_state.update({"trn_ans": ans, "trn_cur": cur + 1})
-                        st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
+                q=qs[cur]; st.markdown(f"**Savol {cur+1}/{len(qs)}:** {q.get('savol','')}")
+                for v in q.get("variantlar",[]):
+                    if st.button(v,key=f"tv{cur}_{v}",use_container_width=True):
+                        ans.append(v[0].upper()==q.get("togri_javob","").upper())
+                        st.session_state.update({"trna":ans,"trnc":cur+1}); st.rerun()
+        st.markdown("</div>",unsafe_allow_html=True)
 
 # ── LIBRARY ───────────────────────────────────────────────────────────────────
-def render_library(u: dict):
+def page_library(u):
     st.markdown("## 📚 Kutubxona")
-    t1, t2, t3 = st.tabs(["💬 Suhbat Tarixi", "📝 Konspekt", "🎓 Sertifikatlar"])
-
-    with t1:
-        hist = load_hist(u["id"])
-        srch = st.text_input("🔍", "", placeholder="Qidirish...", label_visibility="collapsed")
-        filt = ([m for m in hist if srch.lower() in m.get("content","").lower()]
-                if srch else hist)
+    tab1,tab2,tab3=st.tabs(["💬 Suhbat Tarixi","📝 Konspekt","🎓 Sertifikatlar"])
+    with tab1:
+        all_chats=u.get("chats",[])
+        if all_chats:
+            names=[c.get("title","Suhbat") for c in all_chats]
+            sel=st.selectbox("Chat",names,index=0)
+            idx=names.index(sel); cid=all_chats[idx]["id"]
+            hist=load_hist(u["id"],cid)
+        else:
+            hist=load_hist(u["id"]); cid=None
+        srch=st.text_input("🔍","",placeholder="Qidirish...",label_visibility="collapsed")
+        filt=[m for m in hist if srch.lower() in m.get("content","").lower()] if srch else hist
         st.markdown(f"*{len(filt)} ta xabar*")
         for m in reversed(filt[-50:]):
-            role = m.get("role", "user")
-            c    = "#00cfff" if role == "user" else "#7b5ea7"
-            ts   = m.get("ts", "")[:16].replace("T", " ")
-            txt  = m.get("content", "")[:200]
-            st.markdown(
-                f"<div class='gc' style='padding:10px;border-color:{c}40;'>"
-                f"<span style='color:{c};font-size:.8rem;'>"
-                f"{'👤' if role=='user' else '🤖'} {ts}</span><br>"
-                f"<span style='font-size:.9rem;'>{txt}"
-                f"{'...' if len(m.get('content',''))>200 else ''}</span></div>",
-                unsafe_allow_html=True
-            )
-
-    with t2:
-        hist = load_hist(u["id"])
-        n    = st.slider("Oxirgi xabarlar", 5, 50, 20)
-        if st.button("📝 Konspekt Yaratish", use_container_width=True):
-            if hist:
-                with st.spinner("Yaratilmoqda..."):
-                    k = gen_konspekt(u, hist[-n:])
-                st.markdown(f"<div class='gc'>{k}</div>", unsafe_allow_html=True)
-                u = add_xp(u, 15)
-                st.session_state["user"] = u
-                st.download_button(
-                    "⬇️ Yuklab olish", k.encode(),
-                    f"konspekt_{datetime.date.today()}.md", "text/markdown"
-                )
-            else:
-                st.warning("Avval suhbat qiling!")
-
-    with t3:
-        scs = [s for s in u.get("test_scores", []) if s.get("ball", 0) >= 70]
+            role=m.get("role","user"); c="var(--c1)" if role=="user" else "var(--c2)"
+            ts=m.get("ts","")[:16].replace("T"," "); txt=m.get("content","")[:200]
+            st.markdown(f"<div class='gc' style='padding:10px;border-color:{c}33;'><span style='color:{c};font-size:.75rem;'>{'👤' if role=='user' else '🤖'} {ts}</span><br><span style='font-size:.87rem;'>{txt}{'...' if len(m.get('content',''))>200 else ''}</span></div>",unsafe_allow_html=True)
+    with tab2:
+        cid2=u.get("active_chat"); hist2=load_hist(u["id"],cid2)
+        n=st.slider("Oxirgi xabarlar",5,50,20)
+        if st.button("📝 Konspekt Yaratish",use_container_width=True):
+            if hist2:
+                with st.spinner("Yaratilmoqda..."): k=gen_konspekt(u,hist2[-n:])
+                st.markdown(k); u=add_xp(u,15); st.session_state["user"]=u
+                st.download_button("⬇️ Yuklab olish",k.encode(),f"konspekt_{datetime.date.today()}.md","text/markdown")
+            else: st.warning("Avval suhbat qiling!")
+    with tab3:
+        scs=[s for s in u.get("test_scores",[]) if s.get("ball",0)>=70]
         if scs:
             for s in scs[-5:]:
-                st.markdown(f"""<div style='background:linear-gradient(135deg,#0a0a2e,#1a0a3e);
-                    border:2px solid #00cfff;border-radius:16px;
-                    padding:32px;text-align:center;margin-bottom:16px;'>
-                    <div style='font-size:3rem;'>🎓</div>
-                    <h2 style='background:linear-gradient(135deg,#00cfff,#7b5ea7);
-                      -webkit-background-clip:text;-webkit-text-fill-color:transparent;'>
-                      SERTIFIKAT</h2>
-                    <h3 style='color:#fff;'>{u.get('name','')}</h3>
-                    <h3 style='color:#00cfff;'>{s.get('mavzu','')}</h3>
-                    <p style='color:#8892b0;'>{s['ball']}% natija — {s.get('sana','')[:10]}</p>
-                    <p style='color:#8892b0;font-size:.8rem;'>EduAI UZ · Smarter Learning, Better Future</p>
-                </div>""", unsafe_allow_html=True)
-        else:
-            st.info("70%+ ball to'plab sertifikat oling!")
+                st.markdown(f"""<div style='background:linear-gradient(135deg,#080820,#160828);border:2px solid var(--c1);border-radius:14px;padding:24px;text-align:center;margin-bottom:12px;'>
+<div style='font-size:2.2rem;'>🎓</div>
+<h2 style='background:linear-gradient(135deg,var(--c1),var(--c2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;'>SERTIFIKAT</h2>
+<h3 style='color:#fff;margin:6px 0;'>{u.get('name','')}</h3>
+<p style='color:var(--c1);'>{s.get('mavzu','')}</p>
+<p style='color:var(--muted);'>{s['ball']}% · {s.get('sana','')[:10]}</p>
+<p style='color:var(--muted);font-size:.72rem;'>EduAI UZ · Smarter Learning, Better Future</p></div>""",unsafe_allow_html=True)
+        else: st.info("70%+ ball to'plab sertifikat oling!")
 
-
-# ── KITOBLAR ──────────────────────────────────────────────────────────────────
-BOOK_CATEGORIES = {
-    "📐 Matematika":  ["Algebra","Geometriya","Trigonometriya","Analitik geometriya","Oliy matematika"],
-    "🔬 Fizika":      ["Mexanika","Elektr","Optika","Atom fizikasi","Termodinamika"],
-    "🧪 Kimyo":       ["Umumiy kimyo","Organik kimyo","Anorganik kimyo","Analitik kimyo"],
-    "🧬 Biologiya":   ["Zoologiya","Botanika","Anatomiya","Genetika","Ekologiya"],
-    "💻 Informatika": ["Python","JavaScript","Algoritmlar","Ma'lumotlar bazasi","Tarmoqlar"],
-    "🌍 Tarix":       ["O'zbekiston tarixi","Jahon tarixi","Arxeologiya"],
-    "📖 Adabiyot":    ["O'zbek adabiyoti","Jahon adabiyoti","She'riyat"],
-    "🌐 Ingliz tili": ["Grammar","Vocabulary","IELTS","Speaking","Writing"],
-    "📚 Badiiy":      ["Roman","Hikoya","Qissa","Detektiv","Fantastika"],
-}
-
-
-def load_books() -> list:
-    fp = Path("data/books/list.json")
-    if fp.exists():
-        try:
-            with open(fp, encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
-    return []
-
-
-def save_books(books: list):
-    Path("data/books").mkdir(parents=True, exist_ok=True)
-    with open("data/books/list.json", "w", encoding="utf-8") as f:
-        json.dump(books, f, ensure_ascii=False, indent=2)
-
-
-def render_books(u: dict):
-    st.markdown("## 📚 Kitoblar Kutubxonasi")
-    books = load_books()
-
-    cats     = ["Hammasi"] + list(BOOK_CATEGORIES.keys())
-    sel_cat  = st.selectbox("Kategoriya", cats, label_visibility="collapsed")
-
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        search = st.text_input("", "", placeholder="🔍 Kitob nomi yoki muallif...",
-                               label_visibility="collapsed")
-    with c2:
-        sort_by = st.selectbox("", ["Yangi", "Mashhur", "A-Z"], label_visibility="collapsed")
-
-    filtered = books
-    if sel_cat != "Hammasi":
-        filtered = [b for b in filtered if b.get("kategoriya") == sel_cat]
-    if search:
-        filtered = [b for b in filtered
-                    if search.lower() in b.get("nom","").lower()
-                    or search.lower() in b.get("muallif","").lower()
-                    or search.lower() in b.get("tavsif","").lower()]
-    if sort_by == "A-Z":
-        filtered = sorted(filtered, key=lambda x: x.get("nom",""))
-    elif sort_by == "Mashhur":
-        filtered = sorted(filtered, key=lambda x: x.get("views",0), reverse=True)
-    else:
-        filtered = sorted(filtered, key=lambda x: x.get("qoshildi",""), reverse=True)
-
-    if not filtered:
-        st.markdown("""<div class='gc' style='text-align:center;'>
-            <div style='font-size:3rem;'>📚</div>
-            <h3 style='color:#8892b0;'>Hali kitob qo'shilmagan</h3>
-            <p style='color:#445;'>Admin yangi kitoblar qo'shishi kutilmoqda</p>
-        </div>""", unsafe_allow_html=True)
+# ── BOOKS ─────────────────────────────────────────────────────────────────────
+def page_books(u):
+    st.markdown("## 📖 Kitoblar")
+    books=load_books()
+    c1,c2=st.columns([3,1])
+    with c1: srch=st.text_input("","",placeholder="🔍 Kitob nomi...",label_visibility="collapsed")
+    with c2: cat=st.selectbox("",["Hammasi"]+BOOK_CATS,label_visibility="collapsed")
+    filt=books
+    if cat!="Hammasi": filt=[b for b in filt if b.get("kategoriya")==cat]
+    if srch: filt=[b for b in filt if srch.lower() in b.get("nom","").lower() or srch.lower() in b.get("muallif","").lower()]
+    if not filt:
+        st.markdown("<div class='gc' style='text-align:center;'><div style='font-size:2.5rem;'>📚</div><p style='color:var(--muted);'>Hali kitob qo'shilmagan</p></div>",unsafe_allow_html=True)
         return
-
-    st.markdown(
-        f"<p style='color:#8892b0;font-size:.85rem;'>{len(filtered)} ta kitob topildi</p>",
-        unsafe_allow_html=True
-    )
-
-    cols = st.columns(3)
-    for i, book in enumerate(filtered):
-        with cols[i % 3]:
-            cover = book.get("rasm", "")
-            cat   = book.get("kategoriya", "")
-            img_html = (f"<img src='{cover}' style='width:100%;height:180px;"
-                        f"object-fit:cover;border-radius:16px 16px 0 0;'/>"
-                        if cover else
-                        "<div style='width:100%;height:180px;background:linear-gradient("
-                        "135deg,rgba(0,207,255,.15),rgba(123,94,167,.2));"
-                        "border-radius:16px 16px 0 0;display:flex;align-items:center;"
-                        "justify-content:center;font-size:4rem;'>📖</div>")
-            st.markdown(f"""<div class='gc' style='padding:0;overflow:hidden;'>
-                {img_html}
-                <div style='padding:14px;'>
-                  <div style='font-size:.75rem;color:#00cfff;margin-bottom:4px;'>{cat}</div>
-                  <div style='font-weight:700;font-size:.95rem;margin-bottom:4px;'>{book.get("nom","")}</div>
-                  <div style='font-size:.8rem;color:#8892b0;margin-bottom:8px;'>✍️ {book.get("muallif","")}</div>
-                  <div style='font-size:.8rem;color:#8892b0;margin-bottom:10px;'>
-                    {book.get("tavsif","")[:80]}{"..." if len(book.get("tavsif",""))>80 else ""}
-                  </div>
-                  <div style='display:flex;justify-content:space-between;align-items:center;'>
-                    <span style='font-size:.75rem;color:#8892b0;'>👁️ {book.get("views",0)}</span>
-                    <span class='bdg'>{book.get("daraja","Boshlang'ich")}</span>
-                  </div>
-                </div>
-            </div>""", unsafe_allow_html=True)
-
-            if st.button(f"🤖 AI bilan o'rgan", key=f"book_{i}", use_container_width=True):
-                prompt = (f"'{book.get('nom','')}' kitobini tushuntir va o'rgatishni boshla. "
-                          f"Muallif: {book.get('muallif','')}")
-                st.session_state["pend"] = prompt
-                st.session_state["page"] = "chat"
-                # Ko'rildi counter
-                all_books = load_books()
-                for b in all_books:
-                    if b.get("id") == book.get("id"):
-                        b["views"] = b.get("views", 0) + 1
-                save_books(all_books)
-                st.rerun()
-
-    if not is_prem(u) and len(filtered) > 6:
-        st.markdown("""<div class='gc' style='text-align:center;margin-top:8px;'>
-            <p style='color:#8892b0;'>💎 Premium bilan barcha kitoblarga kirish!</p>
-        </div>""", unsafe_allow_html=True)
-        if st.button("💎 Premium olish", use_container_width=True):
-            st.session_state["page"] = "premium"
-            st.rerun()
-
+    cols=st.columns(3)
+    for i,book in enumerate(filt):
+        with cols[i%3]:
+            cover=book.get("rasm","")
+            img=(f"<img src='{cover}' style='width:100%;height:150px;object-fit:cover;border-radius:10px 10px 0 0;'/>" if cover else "<div style='width:100%;height:150px;background:linear-gradient(135deg,rgba(0,212,255,.1),rgba(139,92,246,.15));border-radius:10px 10px 0 0;display:flex;align-items:center;justify-content:center;font-size:2.8rem;'>📖</div>")
+            st.markdown(f"<div class='gc' style='padding:0;overflow:hidden;'>{img}<div style='padding:11px;'><div style='font-size:.7rem;color:var(--c1);margin-bottom:3px;'>{book.get('kategoriya','')}</div><div style='font-weight:700;font-size:.88rem;margin-bottom:3px;'>{book.get('nom','')}</div><div style='font-size:.76rem;color:var(--muted);'>✍️ {book.get('muallif','')}</div></div></div>",unsafe_allow_html=True)
+            if st.button("🤖 O'rgan",key=f"bk{i}",use_container_width=True):
+                st.session_state["pend"]=f"'{book.get('nom','')}' kitobini tushuntir. Muallif: {book.get('muallif','')}"
+                st.session_state["page"]="chat"; st.rerun()
 
 # ── PREMIUM ───────────────────────────────────────────────────────────────────
-def render_premium(u: dict):
-    st.markdown("## 💎 Premium Obuna")
-    cur = get_plan(u)
-    plans_data = [
-        ("free",    "🆓", "Bepul",       0,
-         ["✅ Kuniga 20 savol","✅ Asosiy chat","✅ Oyiga 5 test","❌ Flashcard","❌ Turnir","❌ Cheksiz"]),
-        ("student", "⭐", "Student",  29900,
-         ["✅ Cheksiz savol","✅ Cheksiz test","✅ Flashcard","✅ Turnirlar","✅ Sertifikat","✅ Barcha badge"]),
-        ("pro",     "🏆", "Pro",      59900,
-         ["✅ Student barchasi","✅ Do'stlar tizimi","✅ Virtual sinf","✅ Ota-ona panel","✅ Maxsus sertifikat","✅ Reyting g'olibi"]),
-        ("teacher", "👨‍🏫","O'qituvchi",99900,
-         ["✅ Pro barchasi","✅ Sinf boshqarish","✅ O'z testlari","✅ O'quvchi monitoringi","✅ Admin panel","✅ Cheksiz hamma narsa"]),
+def page_premium(u):
+    st.markdown("## 💎 Premium")
+    lang=st.session_state.get("lang","uz")
+    cur=get_plan(u)
+    data=[
+        ("free","🆓","Bepul",0,["✅ Kuniga 20 savol","✅ Asosiy chat","✅ Oyiga 5 test","❌ Flashcard","❌ Turnir"]),
+        ("student","⭐","Student",29900,["✅ Cheksiz savol","✅ Cheksiz test","✅ Flashcard","✅ Turnirlar","✅ Sertifikat"]),
+        ("pro","🏆","Pro",59900,["✅ Student +","✅ Virtual sinf","✅ Ota-ona panel","✅ Maxsus sertifikat","✅ Reyting bonus"]),
+        ("teacher","👨‍🏫","O'qituvchi",99900,["✅ Pro +","✅ Sinf boshqarish","✅ O'z testlari","✅ O'quvchi monitoring","✅ Admin panel"]),
     ]
-
-    cols = st.columns(4)
-    for col, (pid, em, nom, narx, feats) in zip(cols, plans_data):
+    cols=st.columns(4)
+    for col,(pid,em,nom,narx,feats) in zip(cols,data):
         with col:
-            is_cur = cur == pid
-            bd = "#00cfff" if is_cur else "rgba(255,255,255,.1)"
-            bg = "rgba(0,207,255,.05)" if is_cur else "rgba(255,255,255,.02)"
-            st.markdown(f"""<div style='background:{bg};border:2px solid {bd};
-                border-radius:16px;padding:20px;text-align:center;min-height:380px;'>
-                <div style='font-size:2.5rem;'>{em}</div>
-                <h3 style='color:#fff;margin:8px 0 4px;'>{nom}</h3>
-                <div style='font-size:1.5rem;font-weight:700;color:#00cfff;margin:12px 0;'>
-                  {"Bepul" if narx==0 else f"{narx:,} so'm/oy"}</div>
-                <div style='text-align:left;font-size:.82rem;color:#8892b0;margin:12px 0;'>
-                  {"<br>".join(feats)}</div>
-                {"<div style='color:#00ff9f;font-weight:700;margin-top:8px;'>✅ Joriy</div>" if is_cur else ""}
-            </div>""", unsafe_allow_html=True)
-            if not is_cur and pid != "free":
-                if st.button(f"Sotib olish", key=f"bp_{pid}", use_container_width=True):
-                    st.session_state["sel_plan"] = pid
-
-    sel = st.session_state.get("sel_plan")
-    if sel and sel != "free":
-        pi  = PLANS.get(sel, {})
-        msg = (f"Assalomu alaykum! EduAI UZ da {pi.get('nom','')} "
-               f"({pi.get('narx',0):,} so'm/oy) olmoqchiman. Email: {u.get('email','')}")
+            is_cur=cur==pid; bd="var(--c1)" if is_cur else "rgba(255,255,255,.07)"
+            price_txt = "Bepul" if narx==0 else f"{narx:,} so'm"
+            joriy_txt = '<div style="color:#00ff9f;font-size:.8rem;font-weight:700;">&#10003; Joriy</div>' if is_cur else ""
+            feats_txt = "<br>".join(feats)
+            st.markdown(
+                f"<div style='background:rgba(0,0,0,.25);border:2px solid {bd};"
+                f"border-radius:13px;padding:16px;text-align:center;min-height:300px;'>"
+                f"<div style='font-size:2rem;'>{em}</div>"
+                f"<h3 style='color:#fff;margin:5px 0 3px;font-size:.95rem;'>{nom}</h3>"
+                f"<div style='font-size:1.2rem;font-weight:700;color:var(--c1);margin:8px 0;'>{price_txt}</div>"
+                f"<div style='text-align:left;font-size:.76rem;color:var(--muted);margin:8px 0;'>{feats_txt}</div>"
+                f"{joriy_txt}</div>",
+                unsafe_allow_html=True)
+            if not is_cur and pid!="free":
+                if st.button("Sotib olish",key=f"pb{pid}",use_container_width=True):
+                    st.session_state["selp"]=pid
+    sel=st.session_state.get("selp")
+    if sel and sel!="free":
+        pi=PLANS.get(sel,{}); nom2=pi.get("nom" if lang=="uz" else "name" if lang=="en" else "имя","")
+        msg=f"Assalomu alaykum! EduAI UZ da {nom2} ({pi.get('narx',0):,} so'm/oy) olmoqchiman. Email: {u.get('email','')}"
         st.markdown("---")
-        st.markdown(f"""<div class='gc' style='text-align:center;'>
-            <h3>💬 Telegram orqali sotib olish</h3>
-            <p style='color:#8892b0;'>{pi.get('emoji','')} <b>{pi.get('nom','')}</b>
-              — <b style='color:#00cfff;'>{pi.get('narx',0):,} so'm/oy</b></p>
-            <p style='color:#8892b0;'>
-              1️⃣ Telegram'ga o'ting → 2️⃣ Gaplashing → 3️⃣ To'lang → 4️⃣ Premium yoqiladi
-            </p>
-            <a href='https://t.me/{TELEGRAM_USER}?text={msg}' target='_blank'
-               style='display:inline-block;background:#2AABEE;color:#fff;
-               padding:14px 32px;border-radius:12px;text-decoration:none;
-               font-weight:700;font-size:1rem;margin:12px 0;'>
-               📱 @{TELEGRAM_USER} ga yozing
-            </a>
-            <p style='color:#8892b0;font-size:.8rem;'>
-              📧 Emailingiz: <b style='color:#00cfff;'>{u.get('email','Google bilan kiring')}</b>
-            </p>
-        </div>""", unsafe_allow_html=True)
-
+        st.markdown(f"<div class='gc' style='text-align:center;'><h3>💬 Telegram orqali sotib olish</h3><p style='color:var(--muted);'>{pi.get('emoji','')} <b>{nom2}</b> - <b style='color:var(--c1);'>{pi.get('narx',0):,} so'm/oy</b></p><a href='https://t.me/{TELEGRAM_USER}?text={msg}' target='_blank' style='display:inline-block;background:#2AABEE;color:#fff;padding:11px 28px;border-radius:11px;text-decoration:none;font-weight:700;margin:10px 0;'>📱 @{TELEGRAM_USER}</a><p style='color:var(--muted);font-size:.76rem;margin-top:8px;'>📧 {u.get('email','')}</p></div>",unsafe_allow_html=True)
 
 # ── SETTINGS ──────────────────────────────────────────────────────────────────
-def render_settings(u: dict):
+def page_settings(u):
     st.markdown("## ⚙️ Sozlamalar")
-    c1, c2 = st.columns(2)
-
+    lang=st.session_state.get("lang","uz")
+    c1,c2=st.columns(2)
     with c1:
-        st.markdown("<div class='gc'>", unsafe_allow_html=True)
+        st.markdown("<div class='gc'>",unsafe_allow_html=True)
         st.markdown("### 👤 Profil")
-        nn = st.text_input("Ism", u.get("name", ""))
-        styles = ["o'qituvchi", "do'st", "mentor", "akademik", "qiziqarli"]
-        cur_s  = u.get("settings", {}).get("ai_style", "o'qituvchi")
-        ns = st.selectbox("AI uslubi", styles,
-                          index=styles.index(cur_s) if cur_s in styles else 0)
-        if st.button("💾 Saqlash"):
-            u["name"] = nn
-            u.setdefault("settings", {})["ai_style"] = ns
-            save_user(u)
-            st.session_state["user"] = u
-            st.success("✅ Saqlandi!")
-        st.markdown("</div>", unsafe_allow_html=True)
-
+        nn=st.text_input("Ism",u.get("name",""))
+        stls=["o'qituvchi","do'st","mentor","akademik","qiziqarli"]
+        cs=u.get("settings",{}).get("ai_style","o'qituvchi")
+        ns=st.selectbox("AI uslubi",stls,index=stls.index(cs) if cs in stls else 0)
+        lmap={"uz":"🇺🇿 O'zbek","en":"🇬🇧 English","ru":"🇷🇺 Русский"}
+        nl=st.selectbox("Til",list(lmap.keys()),index=list(lmap.keys()).index(lang),format_func=lambda x:lmap[x])
+        if st.button(t("save")):
+            u["name"]=nn; u.setdefault("settings",{})["ai_style"]=ns; u["lang"]=nl
+            save_user(u); st.session_state.update({"user":u,"lang":nl}); st.success("✅ Saqlandi!"); st.rerun()
+        st.markdown("</div>",unsafe_allow_html=True)
     with c2:
-        st.markdown("<div class='gc'>", unsafe_allow_html=True)
+        st.markdown("<div class='gc'>",unsafe_allow_html=True)
         st.markdown("### 📊 Statistika")
-        lv, ln, _, _ = get_lv(u.get("xp", 0))
-        st.metric("Daraja",   f"Lv.{lv} — {ln}")
-        st.metric("Jami XP",  u.get("xp", 0))
-        st.metric("Streak",   f"{u.get('streak',0)} kun 🔥")
-        st.metric("Xabarlar", u.get("total_messages", 0))
-        st.metric("Obuna",    PLANS.get(get_plan(u), {}).get("nom", ""))
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='gc'>", unsafe_allow_html=True)
-    st.markdown("### ⚠️ Xavfli Zona")
-    ca, cb, cc = st.columns(3)
+        lv,nm,_,_=lv_info(u.get("xp",0),lang)
+        st.metric(t("level"),f"Lv.{lv} - {nm}"); st.metric("XP",u.get("xp",0))
+        st.metric(t("streak"),f"{u.get('streak',0)} {t('streak')} 🔥"); st.metric("Xabarlar",u.get("total_messages",0))
+        st.metric("Obuna",PLANS.get(get_plan(u),{}).get("nom",""))
+        st.markdown("</div>",unsafe_allow_html=True)
+    st.markdown("<div class='gc'>",unsafe_allow_html=True)
+    st.markdown("### ⚠️ Ma'lumotlar")
+    ca,cb,cc=st.columns(3)
     with ca:
         if st.button("🗑️ Tarixni tozalash"):
-            save_hist(u["id"], [])
-            st.session_state["hist"] = []
-            st.success("✅ Tozalandi!")
+            cid=u.get("active_chat"); save_hist(u["id"],[],cid); st.session_state["hist"]=[]; st.success("✅")
     with cb:
-        h = load_hist(u["id"])
-        st.download_button(
-            "⬇️ Tarixni yuklab olish",
-            json.dumps(h, ensure_ascii=False, indent=2).encode(),
-            f"history_{u['id']}.json", "application/json"
-        )
+        h=load_hist(u["id"],u.get("active_chat"))
+        st.download_button("⬇️ Tarix",json.dumps(h,ensure_ascii=False,indent=2).encode(),"history.json","application/json")
     with cc:
-        st.download_button(
-            "⬇️ Profilni yuklab olish",
-            json.dumps(u, ensure_ascii=False, indent=2).encode(),
-            f"profile_{u['id']}.json", "application/json"
-        )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-# ── ADMIN — KITOBLAR ──────────────────────────────────────────────────────────
-def render_admin_books():
-    st.markdown("### 📖 Kitoblar Boshqaruvi")
-    books = load_books()
-    cats  = list(BOOK_CATEGORIES.keys())
-
-    st.markdown("<div class='gc'>", unsafe_allow_html=True)
-    st.markdown("#### ➕ Yangi Kitob Qo'shish")
-    c1, c2 = st.columns(2)
-    with c1:
-        b_nom     = st.text_input("Kitob nomi",  "", key="b_nom")
-        b_muallif = st.text_input("Muallif",     "", key="b_muallif")
-        b_cat     = st.selectbox("Kategoriya", cats, key="b_cat")
-        b_daraja  = st.selectbox("Daraja", ["Boshlang'ich","O'rta","Yuqori","Universitet"], key="b_daraja")
-    with c2:
-        b_rasm   = st.text_input("Rasm URL (ixtiyoriy)", "", key="b_rasm",
-                                 placeholder="https://...")
-        b_yil    = st.text_input("Nashr yili",    "", key="b_yil",    placeholder="2024")
-        b_sahifa = st.text_input("Sahifalar",     "", key="b_sahifa", placeholder="320")
-        b_til    = st.selectbox("Til", ["O'zbek","Rus","Ingliz"], key="b_til")
-    b_tavsif = st.text_area("Tavsif", "", key="b_tavsif", height=100)
-    b_link   = st.text_input("Yuklab olish linki (ixtiyoriy)", "", key="b_link")
-
-    if st.button("✅ Kitob Qo'shish", use_container_width=True, key="add_book_btn"):
-        if b_nom.strip() and b_muallif.strip():
-            new_book = {
-                "id":          len(books) + 1,
-                "nom":         b_nom.strip(),
-                "muallif":     b_muallif.strip(),
-                "kategoriya":  b_cat,
-                "daraja":      b_daraja,
-                "tavsif":      b_tavsif.strip(),
-                "rasm":        b_rasm.strip(),
-                "yil":         b_yil.strip(),
-                "sahifa":      b_sahifa.strip(),
-                "til":         b_til,
-                "link":        b_link.strip(),
-                "views":       0,
-                "qoshildi":    datetime.datetime.now().isoformat(),
-            }
-            books.append(new_book)
-            save_books(books)
-            st.success(f"✅ '{b_nom}' kitob qo'shildi!")
-            st.rerun()
-        else:
-            st.warning("Kitob nomi va muallif kiriting!")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown(f"#### 📋 Barcha Kitoblar ({len(books)} ta)")
-    if not books:
-        st.info("Hali kitob qo'shilmagan.")
-    else:
-        for b in sorted(books, key=lambda x: x.get("qoshildi",""), reverse=True):
-            ca, cb = st.columns([5, 1])
-            with ca:
-                img_html = (f"<img src='{b['rasm']}' style='width:50px;height:60px;"
-                            f"object-fit:cover;border-radius:6px;'/>"
-                            if b.get("rasm") else
-                            "<div style='width:50px;height:60px;background:rgba(123,94,167,.3);"
-                            "border-radius:6px;display:flex;align-items:center;"
-                            "justify-content:center;font-size:1.5rem;'>📖</div>")
-                st.markdown(f"""<div style='background:rgba(0,207,255,.05);
-                    border:1px solid rgba(0,207,255,.15);border-radius:10px;
-                    padding:12px;margin-bottom:6px;'>
-                    <div style='display:flex;gap:12px;align-items:start;'>
-                      {img_html}
-                      <div>
-                        <b style='color:#fff;'>{b.get("nom","")}</b>
-                        <span class='bdg' style='font-size:.7rem;margin-left:6px;'>
-                          {b.get("kategoriya","")}</span><br>
-                        <small style='color:#8892b0;'>
-                          ✍️ {b.get("muallif","")} | {b.get("yil","")} |
-                          {b.get("sahifa","")} bet | {b.get("til","")}</small><br>
-                        <small style='color:#8892b0;'>
-                          👁️ {b.get("views",0)} ko'rildi | {b.get("daraja","")}</small>
-                      </div>
-                    </div>
-                </div>""", unsafe_allow_html=True)
-            with cb:
-                if st.button("🗑️", key=f"del_book_{b['id']}"):
-                    books = [x for x in books if x["id"] != b["id"]]
-                    save_books(books)
-                    st.success("O'chirildi!")
-                    st.rerun()
-
+        st.download_button("⬇️ Profil",json.dumps(u,ensure_ascii=False,indent=2).encode(),"profile.json","application/json")
+    st.markdown("</div>",unsafe_allow_html=True)
 
 # ── ADMIN ─────────────────────────────────────────────────────────────────────
-def render_admin(u: dict):
-    if not is_admin(u):
-        st.error("❌ Ruxsat yo'q!")
-        return
-
+def page_admin(u):
+    if not is_admin(u): st.error("❌ Ruxsat yo'q!"); return
     st.markdown("## 🛡️ Admin Panel")
-    aus = all_users()
-    c1, c2, c3, c4 = st.columns(4)
-    prems = [x for x in aus if is_prem(x)]
-    txp   = sum(x.get("xp",0) for x in aus)
-    with c1: st.metric("👥 Foydalanuvchilar", len(aus))
-    with c2: st.metric("💎 Premium",          len(prems))
-    with c3: st.metric("⚡ Jami XP",          f"{txp:,}")
-    with c4: st.metric("📊 O'rtacha XP",      f"{txp//max(len(aus),1):,}")
+    aus=all_users(); prems=[x for x in aus if is_prem(x)]; txp=sum(x.get("xp",0) for x in aus)
+    c1,c2,c3,c4=st.columns(4)
+    with c1: st.metric("👥 Foydalanuvchilar",len(aus))
+    with c2: st.metric("💎 Premium",len(prems))
+    with c3: st.metric("⚡ Jami XP",f"{txp:,}")
+    with c4: st.metric("📊 O'rtacha",f"{txp//max(len(aus),1):,}")
 
-    t1, t2, t3, t4, t5 = st.tabs([
-        "👥 Foydalanuvchilar", "💎 Premium",
-        "📢 E'lonlar", "📖 Kitoblar", "📊 Statistika"
-    ])
-
-    with t1:
-        srch = st.text_input("Qidirish","", placeholder="Ism yoki email...",
-                             label_visibility="collapsed")
-        filt = ([x for x in aus
-                 if srch.lower() in x.get("name","").lower()
-                 or srch.lower() in x.get("email","").lower()]
-                if srch else aus)
-        for x in sorted(filt, key=lambda z: z.get("xp",0), reverse=True)[:50]:
-            plan    = x.get("premium","free")
-            lv2, ln2, _, _ = get_lv(x.get("xp",0))
-            st.markdown(f"""<div style='background:rgba(255,50,50,.05);
-                border:1px solid rgba(255,50,50,.2);border-radius:12px;
-                padding:10px 16px;margin-bottom:8px;
-                display:flex;justify-content:space-between;align-items:center;'>
-                <div>
-                  <b>{x.get('name','?')}</b>
-                  {'🛡️' if x.get("email","") in ADMIN_EMAILS else ''}
-                  <span class='bdg p{plan}'>{PLANS.get(plan,{}).get('emoji','')} {plan}</span><br>
-                  <small style='color:#8892b0;'>
-                    {x.get('email','')} | Lv.{lv2} | {x.get('xp',0)} XP | 🔥{x.get('streak',0)}
-                  </small>
-                </div>
-                <div style='color:#00cfff;font-size:.85rem;'>{x.get('created','')[:10]}</div>
-            </div>""", unsafe_allow_html=True)
-
-    with t2:
-        st.markdown("### 💎 Premium Boshqarish")
-        emails = [x.get("email","") for x in aus if x.get("email")]
-        te  = st.selectbox("Foydalanuvchi", [""] + emails)
-        np2 = st.selectbox("Yangi Plan", list(PLANS.keys()))
-        exp = st.date_input("Tugash sanasi",
-                            datetime.date.today() + datetime.timedelta(days=30))
-        ca, cb = st.columns(2)
+    tab1,tab2,tab3,tab4=st.tabs(["👥 Foydalanuvchilar","💎 Premium","📢 E'lonlar","📖 Kitoblar"])
+    with tab1:
+        srch=st.text_input("","",placeholder="Qidirish...",label_visibility="collapsed")
+        filt=[x for x in aus if not srch or srch.lower() in x.get("name","").lower() or srch.lower() in x.get("email","").lower()]
+        lang=st.session_state.get("lang","uz")
+        for x in sorted(filt,key=lambda z:z.get("xp",0),reverse=True)[:50]:
+            plan=x.get("premium","free"); lv2,ln2,_,_=lv_info(x.get("xp",0),lang)
+            st.markdown(f"<div class='gc' style='padding:9px;'><b>{x.get('name','?')}</b> {'🛡️' if x.get('email','') in ADMIN_EMAILS else ''} <span class='bdg p{plan}'>{plan}</span><br><small style='color:var(--muted);'>{x.get('email','')} | Lv.{lv2} | {x.get('xp',0)} XP | 🔥{x.get('streak',0)}</small></div>",unsafe_allow_html=True)
+    with tab2:
+        emails=[x.get("email","") for x in aus if x.get("email")]
+        te=st.selectbox("Foydalanuvchi",[""]+emails); np2=st.selectbox("Plan",list(PLANS.keys()))
+        exp=st.date_input("Tugash",datetime.date.today()+datetime.timedelta(days=30))
+        ca,cb=st.columns(2)
         with ca:
-            if st.button("✅ Premium Yoqish", use_container_width=True):
+            if st.button("✅ Yoqish",use_container_width=True):
                 if te:
                     for x in aus:
-                        if x.get("email") == te:
-                            x["premium"]     = np2
-                            x["premium_exp"] = exp.isoformat()
-                            save_user(x)
-                            if np2 != "free" and "premium" not in x.get("badges",[]):
-                                x.setdefault("badges",[]).append("premium")
-                                save_user(x)
-                            st.success(f"✅ {te} ga {np2} yoqildi!")
-                else:
-                    st.warning("Foydalanuvchi tanlang!")
+                        if x.get("email")==te:
+                            x["premium"]=np2; x["premium_exp"]=exp.isoformat()
+                            if np2!="free" and "prem" not in x.get("badges",[]): x.setdefault("badges",[]).append("prem")
+                            save_user(x); st.success(f"✅ {te} ga {np2}!")
         with cb:
-            if st.button("❌ Premium O'chirish", use_container_width=True):
+            if st.button("❌ O'chirish",use_container_width=True):
                 if te:
                     for x in aus:
-                        if x.get("email") == te:
-                            x["premium"]     = "free"
-                            x["premium_exp"] = ""
-                            save_user(x)
-                            st.success("✅ O'chirildi!")
-
-        st.markdown("### Joriy Premium Foydalanuvchilar")
-        for x in aus:
-            if is_prem(x):
-                plan = x.get("premium","")
-                st.markdown(
-                    f"<div style='background:rgba(0,207,255,.05);"
-                    f"border:1px solid rgba(0,207,255,.2);border-radius:10px;"
-                    f"padding:10px;margin-bottom:6px;'>"
-                    f"<b>{x.get('name','')}</b> "
-                    f"<span class='bdg p{plan}'>{plan}</span><br>"
-                    f"<small style='color:#8892b0;'>{x.get('email','')} — {x.get('premium_exp','')}</small>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-
-    with t3:
-        anns = load_ann()
-        st.markdown("<div class='gc'>", unsafe_allow_html=True)
-        at  = st.text_input("Sarlavha", "")
-        atx = st.text_area("Matn", "", height=80)
-        ap  = st.checkbox("Kirish sahifasida ko'rinsin", value=True)
-        if st.button("📢 E'lon Yuborish", use_container_width=True):
+                        if x.get("email")==te: x["premium"]="free"; x["premium_exp"]=""; save_user(x); st.success("✅")
+        for x in [z for z in aus if is_prem(z)]:
+            xplan = x.get("premium","")
+            xname = x.get("name","")
+            xemail = x.get("email","")
+            xexp = x.get("premium_exp","")
+            st.markdown(
+                f"<div class='gc' style='padding:8px;'>"
+                f"<b>{xname}</b> <span class='bdg p{xplan}'>{xplan}</span><br>"
+                f"<small style='color:var(--muted);'>{xemail} - {xexp}</small></div>",
+                unsafe_allow_html=True)
+    with tab3:
+        anns=load_ann()
+        at=st.text_input("Sarlavha",""); atx=st.text_area("Matn","",height=70); ap=st.checkbox("Kirish sahifasida",value=True)
+        if st.button("📢 Yuborish",use_container_width=True):
             if at.strip() and atx.strip():
-                anns.append({
-                    "id": len(anns)+1, "title": at, "text": atx, "public": ap,
-                    "date":   datetime.datetime.now().isoformat(),
-                    "author": u.get("name","Admin")
-                })
-                save_ann(anns)
-                st.success("✅ Yuborildi!")
-            else:
-                st.warning("Sarlavha va matn kiriting!")
-        st.markdown("</div>", unsafe_allow_html=True)
+                anns.append({"id":len(anns)+1,"title":at,"text":atx,"public":ap,"date":datetime.datetime.now().isoformat()})
+                save_ann(anns); st.success("✅")
         for a in reversed(anns):
-            ca, cb = st.columns([5, 1])
-            with ca:
-                st.markdown(
-                    f"<div class='ann'><b>{a['title']}</b><br>{a['text']}<br>"
-                    f"<small style='color:#8892b0;'>{a.get('date','')[:16]}</small></div>",
-                    unsafe_allow_html=True
-                )
-            with cb:
-                if st.button("🗑️", key=f"da{a['id']}"):
-                    anns = [x for x in anns if x["id"] != a["id"]]
-                    save_ann(anns)
-                    st.rerun()
+            ca2,cb2=st.columns([5,1])
+            with ca2: st.markdown(f"<div class='ann'><b>{a['title']}</b><br>{a['text']}</div>",unsafe_allow_html=True)
+            with cb2:
+                if st.button("🗑️",key=f"da{a['id']}"): anns=[x for x in anns if x["id"]!=a["id"]]; save_ann(anns); st.rerun()
+    with tab4:
+        books=load_books()
+        st.markdown("<div class='gc'>",unsafe_allow_html=True)
+        st.markdown("#### ➕ Yangi Kitob")
+        c1,c2=st.columns(2)
+        with c1:
+            bnom=st.text_input("Nomi","",key="bn"); bauth=st.text_input("Muallif","",key="ba")
+            bcat=st.selectbox("Kategoriya",BOOK_CATS,key="bc"); bdara=st.selectbox("Daraja",["Boshlang'ich","O'rta","Yuqori"],key="bd")
+        with c2:
+            bimg=st.text_input("Rasm URL","",key="bi",placeholder="https://..."); byil=st.text_input("Yil","",key="by")
+            btil=st.selectbox("Til",["O'zbek","Rus","Ingliz"],key="bt")
+        btavsif=st.text_area("Tavsif","",key="btv",height=70)
+        if st.button("✅ Qo'shish",use_container_width=True,key="ab"):
+            if bnom.strip() and bauth.strip():
+                books.append({"id":len(books)+1,"nom":bnom.strip(),"muallif":bauth.strip(),
+                              "kategoriya":bcat,"daraja":bdara,"tavsif":btavsif.strip(),
+                              "rasm":bimg.strip(),"yil":byil.strip(),"til":btil,
+                              "views":0,"qoshildi":datetime.datetime.now().isoformat()})
+                save_books(books); st.success("✅ Qo'shildi!"); st.rerun()
+            else: st.warning("Nom va muallif kiriting!")
+        st.markdown("</div>",unsafe_allow_html=True)
+        st.markdown(f"**Kitoblar: {len(books)} ta**")
+        for b in sorted(books,key=lambda x:x.get("qoshildi",""),reverse=True):
+            ca3,cb3=st.columns([5,1])
+            with ca3: st.markdown(f"<div class='gc' style='padding:9px;'><b>{b.get('nom','')}</b> <span class='bdg' style='font-size:.65rem;'>{b.get('kategoriya','')}</span><br><small style='color:var(--muted);'>✍️ {b.get('muallif','')} | 👁️ {b.get('views',0)}</small></div>",unsafe_allow_html=True)
+            with cb3:
+                if st.button("🗑️",key=f"db{b['id']}"): books=[x for x in books if x["id"]!=b["id"]]; save_books(books); st.rerun()
 
-    with t4:
-        render_admin_books()
-
-    with t5:
-        st.markdown("### 📊 Platform Statistikasi")
-        dates  = [(datetime.date.today()-datetime.timedelta(days=i)).isoformat()
-                  for i in range(29,-1,-1)]
-        counts = [random.randint(1, max(len(aus)//2,1)) for _ in dates]
-        fig = go.Figure(go.Bar(x=dates, y=counts, marker_color="#00cfff", opacity=0.8))
-        fig.update_layout(
-            title="Kunlik Faol Foydalanuvchilar",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#e8eaf6"), height=280,
-            xaxis=dict(gridcolor="rgba(255,255,255,.05)"),
-            yaxis=dict(gridcolor="rgba(255,255,255,.05)"),
-            margin=dict(l=20,r=20,t=40,b=40)
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        pc = {}
-        for x in aus:
-            p = x.get("premium","free")
-            pc[p] = pc.get(p,0) + 1
-        if pc:
-            fig2 = go.Figure(go.Pie(
-                labels=[PLANS.get(k,{}).get("nom",k) for k in pc],
-                values=list(pc.values()), hole=0.4,
-                marker_colors=["#444","#f59e0b","#7b5ea7","#059669"]
-            ))
-            fig2.update_layout(
-                title="Obuna Taqsimoti",
-                paper_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#e8eaf6"), height=280,
-                margin=dict(l=20,r=20,t=40,b=20)
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-
-
+# ─────────────────────────────────────────────────────────────────────────────
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    css()
+    inject_css()
 
-    # ── Google OAuth callback qayta ishlash ──────────────────────────────────
-    code = st.query_params.get("code", "")
+    if "lang" not in st.session_state:
+        st.session_state["lang"] = "uz"
 
-    if code and "user" not in st.session_state:
-        ph = st.empty()
-        ph.markdown("""<div style='text-align:center;padding:80px 20px;'>
-            <div style='font-size:3rem;margin-bottom:16px;'>⏳</div>
-            <h3 style='color:#00cfff;'>Google orqali kirilmoqda...</h3>
-            <p style='color:#8892b0;'>Iltimos kuting</p>
-        </div>""", unsafe_allow_html=True)
+    # ── Auto-login: session token ──────────────────────────────────────────
+    if "user" not in st.session_state:
+        params = st.query_params
+        tok    = params.get("sess","") or st.session_state.get("tok","")
+        if tok:
+            uid = chk_token(tok)
+            if uid:
+                u = load_user(uid)
+                if u.get("email"):
+                    u = upd_streak(u)
+                    if not u.get("chats"): new_chat(u)
+                    cid = u.get("active_chat")
+                    st.session_state.update({
+                        "user":u, "page":"chat",
+                        "hist":load_hist(uid,cid),
+                        "tok":tok, "lang":u.get("lang","uz"),
+                    })
+                    if "sess" in st.query_params:
+                        st.query_params.clear()
+                    st.rerun()
 
-        u = g_callback()
-        ph.empty()
-
-        if u:
-            u = upd_streak(u)
-            u = chk_bdg(u)
-            st.session_state["user"] = u
-            st.session_state["hist"] = load_hist(u["id"])
-            st.session_state["page"] = "chat"
-            st.query_params.clear()
-            st.rerun()
-        else:
-            st.query_params.clear()
-            st.session_state["auth_error"] = True
-            st.rerun()
+    # ── Login page ────────────────────────────────────────────────────────
+    if "user" not in st.session_state:
+        page_login()
         return
 
-    # ── Auth xato xabari ─────────────────────────────────────────────────────
-    if st.session_state.pop("auth_error", False):
-        msg = st.session_state.pop("auth_msg", "Noma'lum xato")
-        st.error(f"❌ Google kirish xatosi: {msg}")
-        with st.expander("🔧 Xato tafsilotlari va yechim"):
-            st.code(f"""
-Mumkin bo'lgan sabablar:
-1. Google Console da Redirect URI noto'g'ri.
-   Joriy URI: {REDIRECT_URI}
-   Google Console > Credentials > OAuth 2.0 > Authorized redirect URIs ga qo'shing.
+    # ── Handle URL params ─────────────────────────────────────────────────
+    u      = st.session_state["user"]
+    params = st.query_params
 
-2. GOOGLE_CLIENT_SECRET noto'g'ri yoki eskirgan.
+    if "lang" in params:
+        nl = params["lang"]
+        if nl in ["uz","en","ru"]:
+            st.session_state["lang"] = nl
+            u["lang"] = nl; save_user(u)
 
-3. Xato tavsifi: {msg}
+    if "page" in params:
+        pg = params["page"]
+        if pg in ["chat","analytics","tests","flashcard","tournament","library","books","premium","settings","admin"]:
+            st.session_state["page"] = pg
 
-Yechim: Demo sifatida kiring yoki email/parol bilan ro'yxatdan o'ting.
-""")
+    if params.get("action") == "new_chat":
+        cid = new_chat(u)
+        st.session_state.update({"hist":[],"user":u})
+        st.query_params.clear(); st.rerun()
 
-    # ── Foydalanuvchi tekshirish ──────────────────────────────────────────────
-    if "user" not in st.session_state or not st.session_state.get("user"):
-        render_login()
-        return
+    if "chat_id" in params:
+        cid = params["chat_id"]
+        if cid in [c["id"] for c in u.get("chats",[])]:
+            u["active_chat"] = cid; save_user(u)
+            st.session_state.update({"user":u,"hist":load_hist(u["id"],cid)})
+        st.query_params.clear()
 
-    # ── Asosiy ilova ─────────────────────────────────────────────────────────
-    u = st.session_state["user"]
+    # Clear processed params
+    if any(k in params for k in ["page","lang","action","chat_id"]):
+        st.query_params.clear()
 
-    # Tarixi yo'q bo'lsa yuklab olish
+    st.session_state["user"] = u
+
+    # ── Init hist ────────────────────────────────────────────────────────
     if "hist" not in st.session_state:
-        st.session_state["hist"] = load_hist(u["id"])
+        if not u.get("chats"): new_chat(u); st.session_state["user"]=u
+        st.session_state["hist"] = load_hist(u["id"], u.get("active_chat"))
 
-    render_sidebar(u)
+    if "page" not in st.session_state:
+        st.session_state["page"] = "chat"
 
-    pg = st.session_state.get("page", "chat")
+    pg = st.session_state.get("page","chat")
+
+    # ── Render shell ─────────────────────────────────────────────────────
+    st.markdown('<div id="app-wrap">', unsafe_allow_html=True)
+    st.markdown(shell_html(u, pg), unsafe_allow_html=True)
+
+    # ── Page content ─────────────────────────────────────────────────────
     dispatch = {
-        "chat":       render_chat,
-        "analytics":  render_analytics,
-        "tests":      render_tests,
-        "flashcard":  render_flashcard,
-        "tournament": render_tournament,
-        "library":    render_library,
-        "books":      render_books,
-        "premium":    render_premium,
-        "settings":   render_settings,
-        "admin":      render_admin,
+        "chat":page_chat, "analytics":page_analytics,
+        "tests":page_tests, "flashcard":page_flashcard,
+        "tournament":page_tournament, "library":page_library,
+        "books":page_books, "premium":page_premium,
+        "settings":page_settings, "admin":page_admin,
     }
-    dispatch.get(pg, render_chat)(u)
+    dispatch.get(pg, page_chat)(u)
 
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Logout (sidebar footer) ───────────────────────────────────────────
+    with st.sidebar:
+        if st.button(t("logout"), key="lo_btn", use_container_width=True):
+            st.session_state.clear(); st.query_params.clear(); st.rerun()
 
 if __name__ == "__main__":
     main()
